@@ -28,6 +28,28 @@ app_dir="$HOME/.local/share/mac-windows-ssh-clipboard"
 config_dir="$HOME/.config/mac-windows-ssh-clipboard"
 launch_agents="$HOME/Library/LaunchAgents"
 plist="$launch_agents/com.mac-windows-ssh-clipboard.agent.plist"
+launch_domain="gui/$(id -u)"
+launch_target="$launch_domain/com.mac-windows-ssh-clipboard.agent"
+
+stop_existing_agent() {
+  local attempt
+
+  launchctl bootout "$launch_target" 2>/dev/null || true
+  if launchctl print "$launch_target" >/dev/null 2>&1; then
+    launchctl bootout "$launch_domain" "$plist" 2>/dev/null || true
+  fi
+
+  for attempt in {1..20}; do
+    if ! launchctl print "$launch_target" >/dev/null 2>&1; then
+      sleep 0.2
+      return 0
+    fi
+    sleep 0.1
+  done
+
+  print -u2 -- "Could not stop the existing macOS LaunchAgent."
+  return 1
+}
 
 for command_name in ssh base64 uuidgen xcrun; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
@@ -84,12 +106,15 @@ if [[ "$auto_start" == "yes" ]]; then
   chmod 600 "$plist"
   plutil -lint "$plist" >/dev/null
 
-  launchctl bootout "gui/$(id -u)/com.mac-windows-ssh-clipboard.agent" 2>/dev/null || true
-  launchctl bootstrap "gui/$(id -u)" "$plist"
-  launchctl kickstart "gui/$(id -u)/com.mac-windows-ssh-clipboard.agent"
+  stop_existing_agent
+  if ! launchctl bootstrap "$launch_domain" "$plist"; then
+    sleep 0.5
+    launchctl bootstrap "$launch_domain" "$plist"
+  fi
+  launchctl kickstart "$launch_target"
   print -- "Installed. The bridge is running and will start automatically after macOS sign-in."
 else
-  launchctl bootout "gui/$(id -u)/com.mac-windows-ssh-clipboard.agent" 2>/dev/null || true
+  stop_existing_agent
   rm -f "$plist"
   print -- "Installed without automatic start."
   print -- "Run manually: zsh $app_dir/bridge.zsh"
