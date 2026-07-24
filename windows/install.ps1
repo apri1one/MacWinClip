@@ -1,7 +1,8 @@
 param(
     [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'MacWindowsSSHClipboard'),
     [string]$StartupDirectory = [Environment]::GetFolderPath('Startup'),
-    [switch]$NoStart
+    [switch]$NoStart,
+    [switch]$NoAutoStart
 )
 
 $ErrorActionPreference = 'Stop'
@@ -47,23 +48,32 @@ foreach ($identity in $identities) {
 }
 [IO.Directory]::SetAccessControl($root, $security)
 
-New-Item -ItemType Directory -Force -Path $StartupDirectory | Out-Null
 $shortcutPath = Join-Path $StartupDirectory 'MacWindowsSSHClipboard.lnk'
-$shell = New-Object -ComObject WScript.Shell
-$shortcut = $shell.CreateShortcut($shortcutPath)
-$shortcut.TargetPath = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
-$shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$root\start.ps1`""
-$shortcut.WorkingDirectory = $root
-$shortcut.WindowStyle = 7
-$shortcut.Description = 'Start MacWinClip agent'
-$shortcut.Save()
+if ($NoAutoStart) {
+    Remove-Item -LiteralPath $shortcutPath -Force -ErrorAction SilentlyContinue
+} else {
+    New-Item -ItemType Directory -Force -Path $StartupDirectory | Out-Null
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut($shortcutPath)
+    $shortcut.TargetPath = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
+    $shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$root\start.ps1`""
+    $shortcut.WorkingDirectory = $root
+    $shortcut.WindowStyle = 7
+    $shortcut.Description = 'Start MacWinClip agent'
+    $shortcut.Save()
+}
 
 if (-not $NoStart) {
     & (Join-Path $root 'start.ps1')
 }
 Write-Host "Installed to: $root"
 if ($NoStart) {
-    Write-Host 'Files and startup shortcut installed; agent start was intentionally skipped.'
+    Write-Host 'Files installed; agent start was intentionally skipped.'
 } else {
-    Write-Host 'The agent will start when this Windows user signs in.'
+    Write-Host 'The agent is running in the current Windows GUI session.'
+}
+if ($NoAutoStart) {
+    Write-Host 'Automatic start after Windows sign-in is disabled.'
+} else {
+    Write-Host 'The agent will start automatically after this Windows user signs in.'
 }

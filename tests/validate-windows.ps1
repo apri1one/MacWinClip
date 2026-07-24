@@ -49,6 +49,13 @@ try {
     $shortcut = $shell.CreateShortcut($shortcutPath)
     Assert-True ($shortcut.Arguments -like "*$installRoot\start.ps1*") 'Startup shortcut targets the wrong install.'
 
+    & (Join-Path $projectRoot 'windows\install.ps1') `
+        -InstallRoot $installRoot `
+        -StartupDirectory $startupRoot `
+        -NoStart `
+        -NoAutoStart
+    Assert-True (-not (Test-Path -LiteralPath $shortcutPath)) 'NoAutoStart left the startup shortcut installed.'
+
     $acl = [IO.Directory]::GetAccessControl($installRoot)
     Assert-True $acl.AreAccessRulesProtected 'Install directory still inherits ACL entries.'
     $rules = $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])
@@ -128,7 +135,7 @@ try {
     Assert-True (-not (Test-Path -LiteralPath $installRoot)) 'Uninstall left the application directory.'
     Assert-True (-not (Test-Path -LiteralPath $shortcutPath)) 'Uninstall left the startup shortcut.'
 
-    Write-Output 'PASS Windows isolated install, ACL, shortcut, status, protocol, and uninstall'
+    Write-Output 'PASS Windows isolated install, optional autostart, ACL, status, protocol, and uninstall'
 } finally {
     if ($null -ne $process) {
         if (-not $process.HasExited) {

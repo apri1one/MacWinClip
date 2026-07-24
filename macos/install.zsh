@@ -6,8 +6,14 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   exit 1
 fi
 
+auto_start="yes"
+if (( $# > 0 )) && [[ "$1" == "--no-autostart" ]]; then
+  auto_start="no"
+  shift
+fi
+
 if (( $# != 1 )); then
-  print -u2 -- "Usage: ./macos/install.zsh <windows-user@windows-host-or-ssh-alias>"
+  print -u2 -- "Usage: ./macos/install.zsh [--no-autostart] <windows-user@windows-host-or-ssh-alias>"
   exit 1
 fi
 
@@ -61,12 +67,18 @@ chmod 700 "$app_dir/bridge.zsh" "$app_dir/status.zsh" "$app_dir/uninstall.zsh"
 } > "$config_dir/config.zsh"
 chmod 600 "$config_dir/config.zsh"
 
-cp "$source_dir/com.mac-windows-ssh-clipboard.agent.plist" "$plist"
-chmod 600 "$plist"
-plutil -lint "$plist" >/dev/null
+if [[ "$auto_start" == "yes" ]]; then
+  cp "$source_dir/com.mac-windows-ssh-clipboard.agent.plist" "$plist"
+  chmod 600 "$plist"
+  plutil -lint "$plist" >/dev/null
 
-launchctl bootout "gui/$(id -u)/com.mac-windows-ssh-clipboard.agent" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$plist"
-launchctl kickstart "gui/$(id -u)/com.mac-windows-ssh-clipboard.agent"
-
-print -- "Installed. The bridge is running in the current macOS GUI session."
+  launchctl bootout "gui/$(id -u)/com.mac-windows-ssh-clipboard.agent" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$plist"
+  launchctl kickstart "gui/$(id -u)/com.mac-windows-ssh-clipboard.agent"
+  print -- "Installed. The bridge is running and will start automatically after macOS sign-in."
+else
+  launchctl bootout "gui/$(id -u)/com.mac-windows-ssh-clipboard.agent" 2>/dev/null || true
+  rm -f "$plist"
+  print -- "Installed without automatic start."
+  print -- "Run manually: zsh $app_dir/bridge.zsh"
+fi

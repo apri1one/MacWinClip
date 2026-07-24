@@ -17,17 +17,22 @@ session and the matching Windows GUI user.
 
 ## Installation
 
-1. Follow `docs/NEW-COMPUTER-SETUP.zh-CN.md`.
-2. Verify the Windows host key and:
+1. Tell the user that both Windows and Mac components must be installed.
+2. Before installing, ask whether to enable automatic start after each GUI
+   user signs in. This is not pre-login system boot.
+   - enabled: use the default installers;
+   - disabled: use Windows `-NoAutoStart` and macOS `--no-autostart`.
+3. Follow `docs/NEW-COMPUTER-SETUP.zh-CN.md`.
+4. Verify the Windows host key and:
 
    ```zsh
    ssh -o BatchMode=yes <target> "whoami"
    ```
 
-3. Run `windows/install.ps1` as the logged-in Windows desktop user.
-4. Require `Running=True` and `SessionId != 0`.
-5. Run `macos/install.zsh <target>` locally on the Mac.
-6. Verify `macos/status.zsh`.
+5. Run `windows/install.ps1` as the logged-in Windows desktop user.
+6. Require `Running=True` and `SessionId != 0`.
+7. Run `macos/install.zsh <target>` locally on the Mac.
+8. Verify `macos/status.zsh`.
 
 The SSH user and Windows desktop Agent user must be the same account. Codex
 Cloud must not claim it can reach a private LAN unless an explicit runner or

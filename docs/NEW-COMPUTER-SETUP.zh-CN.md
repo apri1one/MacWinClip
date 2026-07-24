@@ -58,33 +58,41 @@ New-NetFirewallRule `
   -Direction Inbound `
   -Protocol TCP `
   -Action Allow `
-  -LocalPort 22
+  -LocalPort 22 `
+  -Profile Private `
+  -RemoteAddress LocalSubnet
 ```
 
-建议把 Windows 网络配置为“专用网络”，并把防火墙规则限制在专用网络
-或局域网来源。
+该命令只允许专用网络中的本地子网访问。使用私有 VPN 时，应把
+`LocalSubnet` 替换为明确的 VPN 地址段或 Mac 的 VPN 地址，不要改成
+`Any`。
 
 ## 3. 在 Mac 创建 SSH 密钥
 
-先检查是否已经有 Ed25519 密钥：
+建议为 MacWinClip 创建独立的 Ed25519 密钥，避免与 GitHub、服务器或其他
+设备共用同一私钥。先检查是否已经存在：
 
 ```zsh
-test -f ~/.ssh/id_ed25519 && echo "已有密钥" || echo "尚未创建"
+test -f ~/.ssh/macwinclip_ed25519 && echo "已有密钥" || echo "尚未创建"
 ```
 
 只有不存在时才创建：
 
 ```zsh
-ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519
+ssh-keygen -t ed25519 -f ~/.ssh/macwinclip_ed25519
 ```
 
-私钥是 `~/.ssh/id_ed25519`，绝不能发送给别人或 AI。
+私钥是 `~/.ssh/macwinclip_ed25519`，绝不能发送给别人或 AI。
 
 可以分享的是公钥：
 
 ```zsh
-cat ~/.ssh/id_ed25519.pub
+cat ~/.ssh/macwinclip_ed25519.pub
 ```
+
+当前 Beta 使用的是普通 Windows SSH 登录。这个公钥授予目标 Windows
+账户完整的 SSH Shell，不是“只能访问剪贴板”的受限密钥。应优先使用
+非管理员 Windows 桌面账户，并把 Mac 和私钥都视为同一安全边界。
 
 ## 4. 把 Mac 公钥安装到 Windows
 
@@ -156,7 +164,7 @@ exit
 Host my-windows
     HostName 192.168.x.x
     User Windows用户名
-    IdentityFile ~/.ssh/id_ed25519
+    IdentityFile ~/.ssh/macwinclip_ed25519
     IdentitiesOnly yes
     ServerAliveInterval 15
     ServerAliveCountMax 3
@@ -181,4 +189,3 @@ ssh -o BatchMode=yes my-windows "whoami"
 - IP 变化：设置 DHCP 保留或更新 SSH alias。
 - Mac 能 SSH，但 Windows 剪贴板不变：Windows 桌面 Agent 没有运行，
   或它错误地运行在 Session 0。
-

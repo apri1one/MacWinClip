@@ -1,7 +1,7 @@
 # MacWinClip
 
-一个无账号、无云中继、基于 SSH 长连接的 macOS ↔ Windows 双向纯文本
-剪贴板桥。
+一个无需第三方账号、无云中继、基于 SSH 长连接的 macOS ↔ Windows
+双向纯文本剪贴板桥。
 
 > **Beta 状态：**隔离安装、协议、ACL、卸载和跨平台语法验证已经通过；
 > 尚未在一组全新 Windows GUI 用户与全新 macOS Aqua 用户上完成真实剪贴板
@@ -48,6 +48,13 @@ Aqua/GUI LaunchAgent 中。
 
 ## 安装
 
+**Windows 和 Mac 两端都要安装。**Windows 运行桌面剪贴板 Agent 和 SSH
+中继；Mac 运行 SSH 长连接客户端。
+
+安装前先决定是否启用自动启动。这里的“开机启动”准确说是**用户登录图形
+桌面后启动**；登录前没有可访问的用户剪贴板。默认启用，适合长期使用。
+启用后程序会在后台持续观察并同步以后复制的文本。
+
 ### 1. Windows
 
 在当前桌面用户的普通 PowerShell 中，从仓库根目录运行：
@@ -65,6 +72,14 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 安装器会收紧目录 ACL、启动桌面 Agent，并为当前用户创建登录启动项。
 
+如果只想当前登录期间使用，不希望下次登录自动启动：
+
+```powershell
+.\windows\install.ps1 -NoAutoStart
+```
+
+这仍会立即启动当前 Windows Agent，但不会创建登录启动项。
+
 ### 2. Mac
 
 ```zsh
@@ -73,6 +88,18 @@ zsh ./macos/install.zsh <Windows别名>
 
 安装器使用当前用户的 Aqua LaunchAgent，不会使用 AppleScript、Terminal
 控制、Accessibility 或 Automation 权限。
+
+如果不希望登录后自动启动：
+
+```zsh
+zsh ./macos/install.zsh --no-autostart <Windows别名>
+```
+
+该模式只安装文件和配置，不启动后台桥。需要使用时在 Mac 前台运行：
+
+```zsh
+zsh ~/.local/share/mac-windows-ssh-clipboard/bridge.zsh
+```
 
 ## 状态、停止与卸载
 
@@ -132,13 +159,18 @@ zsh ./tests/validate-macos.zsh
 
 ## 能力与安全边界
 
-- 只同步 1 MiB 以内的非空纯文本；
+- Mac→Windows 限制为 1 MiB 以内的非空纯文本；当前 Beta 的
+  Windows→Mac 方向还没有等价大小限制，不要复制超大文本；
+- 启动后，之后复制的文本都可能自动发送到另一台机器，包括密码、验证码、
+  恢复短语、API key 和钱包地址；不要在不互信的两台设备之间启用；
 - 快速连续复制时以最新状态为主，不保证保存每个中间事件；
 - 同时在两端复制属于冲突场景，不提供全局顺序保证；
 - 机器睡眠或网络中断时暂停，恢复后自动重连；
 - 两个方向的队列正文都可能短暂明文落在当前 Windows 用户的私有目录；
 - 确认和处理后会删除队列文件，但普通删除不等于安全擦除；
 - SSH 提供传输加密，本项目不另加应用层端到端加密；
+- 当前 Beta 的 SSH 公钥授予目标 Windows 账户完整 Shell，不是剪贴板专用
+  权限；优先使用独立密钥和非管理员账户；
 - 不要把 TCP 22 直接暴露到公网，使用可信局域网或私有 VPN；
 - 不支持图片、文件、富文本、历史记录、iPhone 或云同步。
 
@@ -148,12 +180,21 @@ zsh ./tests/validate-macos.zsh
 
 - Windows SSH alias，或 Windows 用户名与局域网地址；
 - Windows 用户是否属于 Administrators；
-- Mac **公钥文件路径**，例如 `~/.ssh/id_ed25519.pub`；
+- Mac **公钥文件路径**，例如 `~/.ssh/macwinclip_ed25519.pub`；
 - 两台机器上的仓库路径和网络关系。
 
 不要提供 SSH 私钥正文、系统密码、token 或真实剪贴板内容。要求 Codex
-先阅读本仓库的 `AGENTS.md`，按 Windows → Mac 顺序安装，并用不敏感文本
-分别验证两个方向、SessionId、无回环和队列清空。
+先阅读本仓库的 `AGENTS.md`，**安装前先询问是否启用登录后自动启动**，
+再按 Windows → Mac 顺序安装，并用不敏感文本分别验证两个方向、
+SessionId、无回环和队列清空。
+
+可以把下面这段和 GitHub 链接一起发给 Agent：
+
+```text
+请先完整阅读 README.md 和 AGENTS.md。先询问我是否启用 Windows 与 Mac
+用户登录后的自动启动，再按选择安装两端。不得读取或输出真实剪贴板、私钥、
+密码或 token。最后验证 Windows SessionId、两个同步方向、无回环和卸载命令。
+```
 
 Codex Cloud 通常无法直接访问家庭局域网，可以修改仓库，但本地安装和验收
 仍需本地 Codex、人工终端或明确连接到局域网的 runner。
