@@ -7,4 +7,5 @@ launchctl bootout "$label" 2>/dev/null || true
 rm -f "$HOME/Library/LaunchAgents/com.mac-windows-ssh-clipboard.agent.plist"
 rm -rf "$HOME/.local/share/mac-windows-ssh-clipboard"
 rm -rf "$HOME/.config/mac-windows-ssh-clipboard"
+rm -rf "$HOME/Library/Caches/mac-windows-ssh-clipboard"
 print -- "macOS clipboard bridge removed."

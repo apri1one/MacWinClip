@@ -1,7 +1,7 @@
 # MacWinClip
 
-一个无账号、无云中继、基于 SSH 长连接的 macOS ↔ Windows 双向纯文本
-剪贴板桥。
+一个无账号、无云中继、基于 SSH 长连接的 macOS ↔ Windows 双向
+文本与图片剪贴板桥。截图复制到剪贴板后会默认自动同步。
 
 > **Beta 状态：**隔离安装、协议、ACL、卸载和跨平台语法验证已经通过；
 > 尚未在一组全新 Windows GUI 用户与全新 macOS Aqua 用户上完成真实剪贴板
@@ -34,6 +34,8 @@ Aqua/GUI LaunchAgent 中。
 - Windows 10 1809+ 或 Windows 11；
 - Windows PowerShell 5.1+；
 - Windows 已安装并启动 OpenSSH Server；
+- Mac 已安装 Apple Command Line Tools，可执行
+  `xcrun --find swiftc`；若缺少，先运行 `xcode-select --install`；
 - Mac 与 Windows 位于同一可信局域网或私有 VPN；
 - SSH 用户必须与运行 Windows 剪贴板 Agent 的桌面用户相同；
 - Mac 可以无交互执行：
@@ -53,7 +55,7 @@ Aqua/GUI LaunchAgent 中。
 
 安装前先决定是否启用自动启动。这里的“开机启动”准确说是**用户登录图形
 桌面后启动**；登录前没有可访问的用户剪贴板。默认启用，适合长期使用。
-启用后程序会在后台持续观察并同步以后复制的文本。
+启用后程序会在后台持续观察并同步以后复制的文本与图片。
 
 ### 1. Windows
 
@@ -86,8 +88,9 @@ Set-ExecutionPolicy -Scope Process Bypass
 zsh ./macos/install.zsh <Windows别名>
 ```
 
-安装器使用当前用户的 Aqua LaunchAgent，不会使用 AppleScript、Terminal
-控制、Accessibility 或 Automation 权限。
+安装器会用 Apple Command Line Tools 在本机编译剪贴板辅助程序，并使用
+当前用户的 Aqua LaunchAgent；不会使用 AppleScript、Terminal 控制、
+Accessibility 或 Automation 权限。
 
 如果不希望登录后自动启动：
 
@@ -144,8 +147,13 @@ windows_reachable=yes
 
 ## 验收
 
-分别在 Mac 和 Windows 复制一段不敏感文本，确认另一端可以粘贴；再观察
-是否发生反向回环。不要用密码、验证码、恢复短语或私钥做测试。
+分别在 Mac 和 Windows 复制一段不敏感文本，确认另一端可以粘贴。再分别
+把一张测试截图复制到剪贴板，确认另一端能粘贴图片，并观察是否发生反向
+回环。不要用密码、验证码、恢复短语、私钥或敏感截图做测试。
+
+- Windows：用截图工具截取后，确保截图进入剪贴板；
+- Mac：使用 `Control-Shift-Command-3/4`，或在“截屏”选项中选择复制到
+  剪贴板。
 
 不接触剪贴板的开发验证：
 
@@ -159,15 +167,18 @@ zsh ./tests/validate-macos.zsh
 
 ## 能力与安全边界
 
-- 只同步 1 MiB 以内的非空纯文本；
+- 默认同步 1 MiB 以内的非空纯文本，以及 16 MiB 以内的剪贴板图片；
+- 图片在传输前统一为 PNG；支持截图和应用中“复制图片”，不支持在 Finder
+  或资源管理器里复制的文件/文件列表；
 - 快速连续复制时以最新状态为主，不保证保存每个中间事件；
 - 同时在两端复制属于冲突场景，不提供全局顺序保证；
 - 机器睡眠或网络中断时暂停，恢复后自动重连；
-- 两个方向的队列正文都可能短暂明文落在当前 Windows 用户的私有目录；
+- 两个方向的队列正文都可能短暂明文落在 Windows 用户私有目录或 Mac
+  用户私有缓存目录；
 - 确认和处理后会删除队列文件，但普通删除不等于安全擦除；
 - SSH 提供传输加密，本项目不另加应用层端到端加密；
 - 不要把 TCP 22 直接暴露到公网，使用可信局域网或私有 VPN；
-- 不支持图片、文件、富文本、历史记录、iPhone 或云同步。
+- 不支持文件、富文本格式、历史记录、iPhone 或云同步。
 
 ## 交给 Codex 安装
 
@@ -180,8 +191,8 @@ zsh ./tests/validate-macos.zsh
 
 不要提供 SSH 私钥正文、系统密码、token 或真实剪贴板内容。要求 Codex
 先阅读本仓库的 `AGENTS.md`，**安装前先询问是否启用登录后自动启动**，
-再按 Windows → Mac 顺序安装，并用不敏感文本分别验证两个方向、
-SessionId、无回环和队列清空。
+再按 Windows → Mac 顺序安装，并用不敏感文本和测试截图分别验证两个
+方向、SessionId、无回环和队列清空。
 
 可以把下面这段和 GitHub 链接一起发给 Agent：
 
@@ -189,6 +200,7 @@ SessionId、无回环和队列清空。
 请先完整阅读 README.md 和 AGENTS.md。先询问我是否启用 Windows 与 Mac
 用户登录后的自动启动，再按选择安装两端。不得读取或输出真实剪贴板、私钥、
 密码或 token。最后验证 Windows SessionId、两个同步方向、无回环和卸载命令。
+文本与剪贴板图片都应测试；不要读取、打印或上传测试前已有的剪贴板内容。
 ```
 
 Codex Cloud 通常无法直接访问家庭局域网，可以修改仓库，但本地安装和验收

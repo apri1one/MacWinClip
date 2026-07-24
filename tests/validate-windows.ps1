@@ -76,11 +76,29 @@ try {
     $relayRoot = Join-Path $testRoot 'relay'
     New-Item -ItemType Directory -Path $relayRoot | Out-Null
     Copy-Item -LiteralPath (Join-Path $projectRoot 'windows\remote.ps1') -Destination $relayRoot
-    $windowsId = [Guid]::NewGuid().ToString('N')
-    $macId = [Guid]::NewGuid().ToString('N')
-    $windowsBytes = [Text.Encoding]::UTF8.GetBytes('controlled-windows-direction')
-    $macBytes = [Text.Encoding]::UTF8.GetBytes('controlled-mac-direction')
-    [IO.File]::WriteAllBytes((Join-Path $relayRoot "outbound.$windowsId.msg"), $windowsBytes)
+    $windowsImageId = [Guid]::NewGuid().ToString('N')
+    $windowsTextId = [Guid]::NewGuid().ToString('N')
+    $macTextId = [Guid]::NewGuid().ToString('N')
+    $macImageId = [Guid]::NewGuid().ToString('N')
+    Add-Type -AssemblyName System.Drawing
+    $bitmap = [Drawing.Bitmap]::new(2, 2)
+    $imageMemory = [IO.MemoryStream]::new()
+    try {
+        $bitmap.SetPixel(0, 0, [Drawing.Color]::Red)
+        $bitmap.SetPixel(1, 1, [Drawing.Color]::Blue)
+        $bitmap.Save($imageMemory, [Drawing.Imaging.ImageFormat]::Png)
+        $windowsBytes = $imageMemory.ToArray()
+    } finally {
+        $imageMemory.Dispose()
+        $bitmap.Dispose()
+    }
+    $windowsTextBytes = [Text.Encoding]::UTF8.GetBytes('controlled-windows-text-direction')
+    $macTextBytes = [Text.Encoding]::UTF8.GetBytes('controlled-mac-text-direction')
+    $macImageBytes = $windowsBytes
+    [IO.File]::WriteAllBytes(
+        (Join-Path $relayRoot "outbound.$windowsImageId.png.msg"),
+        $windowsBytes
+    )
 
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
@@ -95,33 +113,67 @@ try {
     Assert-True $process.Start() 'Could not start the isolated stream relay.'
 
     $line = Read-LineWithTimeout $process 3000 'Windows-to-Mac frame'
-    $expected = 'SET ' + $windowsId + ' ' + [Convert]::ToBase64String($windowsBytes)
+    $expected = 'SET ' + $windowsImageId + ' PNG ' + [Convert]::ToBase64String($windowsBytes)
     Assert-True ($line -eq $expected) 'Windows-to-Mac protocol frame mismatch.'
 
-    $process.StandardInput.WriteLine("ACK $windowsId")
-    $process.StandardInput.WriteLine(('SET ' + $macId + ' ' + [Convert]::ToBase64String($macBytes)))
+    $process.StandardInput.WriteLine("ACK $windowsImageId")
+    $process.StandardInput.WriteLine(
+        ('SET ' + $macTextId + ' TEXT ' + [Convert]::ToBase64String($macTextBytes))
+    )
     $process.StandardInput.Flush()
 
     $receivedAck = $false
     for ($attempt = 0; $attempt -lt 4 -and -not $receivedAck; $attempt++) {
         $line = Read-LineWithTimeout $process 3000 'Mac-to-Windows acknowledgement'
-        if ($line -eq "ACK $macId") {
+        if ($line -eq "ACK $macTextId") {
             $receivedAck = $true
         }
     }
     Assert-True $receivedAck 'Mac-to-Windows acknowledgement was not received.'
 
     $deadline = [DateTime]::UtcNow.AddSeconds(3)
-    $outboundPath = Join-Path $relayRoot "outbound.$windowsId.msg"
+    $outboundPath = Join-Path $relayRoot "outbound.$windowsImageId.png.msg"
     while ((Test-Path -LiteralPath $outboundPath) -and [DateTime]::UtcNow -lt $deadline) {
         Start-Sleep -Milliseconds 25
     }
     Assert-True (-not (Test-Path -LiteralPath $outboundPath)) 'Acknowledged outbound payload remains.'
 
-    $receivedBytes = [IO.File]::ReadAllBytes((Join-Path $relayRoot "inbox\$macId.msg"))
+    $receivedBytes = [IO.File]::ReadAllBytes(
+        (Join-Path $relayRoot "inbox\$macTextId.text.msg")
+    )
     Assert-True (
-        [Convert]::ToBase64String($receivedBytes) -eq [Convert]::ToBase64String($macBytes)
-    ) 'Mac-to-Windows payload mismatch.'
+        [Convert]::ToBase64String($receivedBytes) -eq [Convert]::ToBase64String($macTextBytes)
+    ) 'Mac-to-Windows text payload mismatch.'
+
+    [IO.File]::WriteAllBytes(
+        (Join-Path $relayRoot "outbound.$windowsTextId.text.msg"),
+        $windowsTextBytes
+    )
+    $line = Read-LineWithTimeout $process 3000 'Windows-to-Mac text frame'
+    $expected = 'SET ' + $windowsTextId + ' TEXT ' +
+        [Convert]::ToBase64String($windowsTextBytes)
+    Assert-True ($line -eq $expected) 'Windows-to-Mac text protocol frame mismatch.'
+    $process.StandardInput.WriteLine("ACK $windowsTextId")
+    $process.StandardInput.WriteLine(
+        ('SET ' + $macImageId + ' PNG ' + [Convert]::ToBase64String($macImageBytes))
+    )
+    $process.StandardInput.Flush()
+
+    $receivedAck = $false
+    for ($attempt = 0; $attempt -lt 4 -and -not $receivedAck; $attempt++) {
+        $line = Read-LineWithTimeout $process 3000 'Mac-to-Windows image acknowledgement'
+        if ($line -eq "ACK $macImageId") {
+            $receivedAck = $true
+        }
+    }
+    Assert-True $receivedAck 'Mac-to-Windows image acknowledgement was not received.'
+
+    $receivedBytes = [IO.File]::ReadAllBytes(
+        (Join-Path $relayRoot "inbox\$macImageId.png.msg")
+    )
+    Assert-True (
+        [Convert]::ToBase64String($receivedBytes) -eq [Convert]::ToBase64String($macImageBytes)
+    ) 'Mac-to-Windows image payload mismatch.'
 
     $process.StandardInput.Close()
     Assert-True $process.WaitForExit(3000) 'Relay did not stop when stdin closed.'

@@ -29,12 +29,16 @@ config_dir="$HOME/.config/mac-windows-ssh-clipboard"
 launch_agents="$HOME/Library/LaunchAgents"
 plist="$launch_agents/com.mac-windows-ssh-clipboard.agent.plist"
 
-for command_name in ssh pbcopy pbpaste shasum base64; do
+for command_name in ssh base64 uuidgen xcrun; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
     print -u2 -- "Missing command: $command_name"
     exit 1
   fi
 done
+if ! xcrun --find swiftc >/dev/null 2>&1; then
+  print -u2 -- "Missing Swift compiler. Install Apple Command Line Tools first: xcode-select --install"
+  exit 1
+fi
 
 remote_root="$(ssh -T -o BatchMode=yes -o ConnectTimeout=8 -o ClearAllForwardings=yes \
   "$ssh_target" 'powershell -NoProfile -Command "[Console]::Out.Write($env:LOCALAPPDATA)"')"
@@ -58,12 +62,19 @@ cp "$source_dir/bridge.zsh" "$app_dir/bridge.zsh"
 cp "$source_dir/status.zsh" "$app_dir/status.zsh"
 cp "$source_dir/uninstall.zsh" "$app_dir/uninstall.zsh"
 chmod 700 "$app_dir/bridge.zsh" "$app_dir/status.zsh" "$app_dir/uninstall.zsh"
+xcrun swiftc -O "$source_dir/clipboard-helper.swift" -framework AppKit \
+  -o "$app_dir/clipboard-helper.new"
+mv -f "$app_dir/clipboard-helper.new" "$app_dir/clipboard-helper"
+chmod 700 "$app_dir/clipboard-helper"
 
 {
   printf 'SSH_TARGET=%q\n' "$ssh_target"
   printf 'WINDOWS_REMOTE_SCRIPT=%q\n' "$remote_script"
+  printf 'CLIPBOARD_HELPER=%q\n' "$app_dir/clipboard-helper"
   printf 'CLIPBOARD_CHECK_INTERVAL=%q\n' "0.2"
   printf 'RECONNECT_INTERVAL=%q\n' "1"
+  printf 'MAX_TEXT_BYTES=%q\n' "1048576"
+  printf 'MAX_IMAGE_BYTES=%q\n' "16777216"
 } > "$config_dir/config.zsh"
 chmod 600 "$config_dir/config.zsh"
 

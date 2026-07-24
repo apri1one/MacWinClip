@@ -1,7 +1,7 @@
 # MacWinClip agent rules
 
-This repository installs a plain-text clipboard bridge between one macOS GUI
-session and the matching Windows GUI user.
+This repository installs a text-and-image clipboard bridge between one macOS
+GUI session and the matching Windows GUI user.
 
 ## Invariants
 
@@ -12,6 +12,9 @@ session and the matching Windows GUI user.
 - Only `windows/agent.ps1` in a nonzero desktop SessionId may use
   `Get-Clipboard` or `Set-Clipboard`.
 - macOS clipboard access must stay in the current user's Aqua LaunchAgent.
+- Support only `TEXT` and `PNG` protocol payloads. Clipboard images are enabled
+  by default; copied files and file lists are out of scope.
+- Limit UTF-8 text to 1 MiB and normalized PNG data to 16 MiB.
 - Do not use AppleScript, `osascript`, Terminal control, Accessibility or UI
   automation.
 
@@ -31,8 +34,9 @@ session and the matching Windows GUI user.
 
 5. Run `windows/install.ps1` as the logged-in Windows desktop user.
 6. Require `Running=True` and `SessionId != 0`.
-7. Run `macos/install.zsh <target>` locally on the Mac.
-8. Verify `macos/status.zsh`.
+7. Require `xcrun --find swiftc` on the Mac.
+8. Run `macos/install.zsh <target>` locally on the Mac.
+9. Verify `macos/status.zsh`.
 
 The SSH user and Windows desktop Agent user must be the same account. Codex
 Cloud must not claim it can reach a private LAN unless an explicit runner or
@@ -44,11 +48,12 @@ route has been verified.
 - Never request or expose private keys, passwords or tokens.
 - Preserve existing SSH configuration and host-key checking.
 - Do not expose TCP 22 to the public Internet.
-- Use generated, non-sensitive text to test each direction separately.
+- Use generated, non-sensitive text and test images to test each direction
+  separately.
 - Verify no echo loop, queues eventually return to zero, and one persistent
   `stream` SSH process carries normal traffic.
-- Do not add files, images, rich text, history, iPhone or cloud features unless
-  scope is explicitly expanded.
+- Do not add files, rich text, history, iPhone or cloud features unless scope
+  is explicitly expanded.
 - All changes must remain reversible with the included uninstall scripts.
 
 Before release, run `tests/validate-windows.ps1` and

@@ -56,7 +56,7 @@ if ($NoAutoStart) {
     $shell = New-Object -ComObject WScript.Shell
     $shortcut = $shell.CreateShortcut($shortcutPath)
     $shortcut.TargetPath = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
-    $shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$root\start.ps1`""
+    $shortcut.Arguments = "-NoProfile -Sta -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$root\start.ps1`""
     $shortcut.WorkingDirectory = $root
     $shortcut.WindowStyle = 7
     $shortcut.Description = 'Start MacWinClip agent'
