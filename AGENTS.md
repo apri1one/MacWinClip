@@ -1,4 +1,4 @@
-# Agent rules
+# MacWinClip agent rules
 
 This repository installs a plain-text clipboard bridge between one macOS GUI
 session and the matching Windows GUI user.

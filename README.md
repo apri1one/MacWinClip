@@ -1,6 +1,11 @@
-# Mac–Windows SSH 双向剪贴板
+# MacWinClip
 
-一个无账号、无云中继的 macOS ↔ Windows 双向纯文本剪贴板桥。
+一个无账号、无云中继、基于 SSH 长连接的 macOS ↔ Windows 双向纯文本
+剪贴板桥。
+
+> **Beta 状态：**隔离安装、协议、ACL、卸载和跨平台语法验证已经通过；
+> 尚未在一组全新 Windows GUI 用户与全新 macOS Aqua 用户上完成真实剪贴板
+> 端到端验收。当前版本适合测试，不应视为已经完成生产级双机认证。
 
 ## 工作方式
 

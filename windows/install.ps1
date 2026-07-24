@@ -55,7 +55,7 @@ $shortcut.TargetPath = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.e
 $shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$root\start.ps1`""
 $shortcut.WorkingDirectory = $root
 $shortcut.WindowStyle = 7
-$shortcut.Description = 'Start Mac-Windows SSH Clipboard agent'
+$shortcut.Description = 'Start MacWinClip agent'
 $shortcut.Save()
 
 if (-not $NoStart) {
