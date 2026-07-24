@@ -19,6 +19,12 @@ if ($null -eq $sshd -or $sshd.Status -ne 'Running') {
 $source = $PSScriptRoot
 $root = $InstallRoot
 $inboxRoot = Join-Path $root 'inbox'
+
+$existingStop = Join-Path $root 'stop.ps1'
+if (Test-Path -LiteralPath $existingStop) {
+    & $existingStop
+}
+
 New-Item -ItemType Directory -Force -Path $inboxRoot | Out-Null
 
 foreach ($name in 'agent.ps1', 'remote.ps1', 'start.ps1', 'stop.ps1', 'status.ps1', 'uninstall.ps1') {
