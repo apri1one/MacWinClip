@@ -13,7 +13,23 @@ $maxProtocolLineLength = 24000000
 New-Item -ItemType Directory -Force -Path $inboxRoot | Out-Null
 
 if ($Action -eq 'health') {
-    [Console]::Out.Write('OK')
+    $pidFile = Join-Path $root 'agent.pid'
+    if (-not (Test-Path -LiteralPath $pidFile)) {
+        exit 1
+    }
+
+    try {
+        $agentPid = [int](Get-Content -LiteralPath $pidFile -Raw)
+        $agentProcess = Get-Process -Id $agentPid -ErrorAction Stop
+    } catch {
+        exit 1
+    }
+
+    if ($agentProcess.SessionId -eq 0) {
+        exit 1
+    }
+
+    [Console]::Out.Write("OK V2 $($agentProcess.SessionId)")
     exit 0
 }
 

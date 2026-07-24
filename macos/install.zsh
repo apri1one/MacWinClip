@@ -50,7 +50,7 @@ fi
 remote_script="${remote_root}\\MacWindowsSSHClipboard\\remote.ps1"
 health_command="powershell -NoProfile -ExecutionPolicy Bypass -File \"$remote_script\" health"
 health="$(ssh -T -o BatchMode=yes -o ConnectTimeout=8 -o ClearAllForwardings=yes "$ssh_target" "$health_command")"
-if [[ "$health" != "OK" ]]; then
+if [[ ! "$health" =~ '^OK V2 [1-9][0-9]*$' ]]; then
   print -u2 -- "Windows bridge health check failed. Run windows/install.ps1 on Windows first."
   exit 1
 fi
