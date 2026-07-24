@@ -1,78 +1,51 @@
-# Agent instructions
+# Agent rules
 
-This repository installs a text-only clipboard bridge between one macOS GUI
-login session and one Windows GUI login session.
+This repository installs a plain-text clipboard bridge between one macOS GUI
+session and the matching Windows GUI user.
 
-## Architecture invariants
+## Invariants
 
-- The Mac is the only SSH client; Windows runs OpenSSH Server.
-- One persistent SSH process carries both directions:
-  - Mac→Windows: `SET` frames on SSH stdin.
-  - Windows→Mac: `SET` frames on SSH stdout.
-  - Each receiver returns an `ACK` frame.
-- Local clipboard checks may be periodic, but do not replace the persistent SSH
-  stream with repeated SSH `fetch` commands.
-- The Windows OpenSSH session never calls `Set-Clipboard` or `Get-Clipboard`.
-- Only `windows/agent.ps1`, running in the interactive user's nonzero session,
-  accesses the Windows clipboard.
-- Only the macOS LaunchAgent in the Aqua GUI domain accesses `pbcopy`/`pbpaste`.
-- Do not add AppleScript, `osascript`, Accessibility, Terminal automation, or
-  UI scripting.
+- Detect the current OS before running commands.
+- Mac is the only SSH client; Windows runs OpenSSH Server.
+- Keep one persistent SSH process: Mac→Windows uses stdin, Windows→Mac stdout.
+- Never let the Windows SSH/Session 0 process access the desktop clipboard.
+- Only `windows/agent.ps1` in a nonzero desktop SessionId may use
+  `Get-Clipboard` or `Set-Clipboard`.
+- macOS clipboard access must stay in the current user's Aqua LaunchAgent.
+- Do not use AppleScript, `osascript`, Terminal control, Accessibility or UI
+  automation.
 
-## Before changing or installing anything
+## Installation
 
-1. Detect the current platform.
-2. Obtain the Windows hostname/IP, Windows username, administrator membership,
-   network scope, and repository paths.
-3. Ask for the Mac public-key path only. Never request a private key.
-4. Verify the Windows host key and then verify:
+1. Follow `docs/NEW-COMPUTER-SETUP.zh-CN.md`.
+2. Verify the Windows host key and:
 
    ```zsh
    ssh -o BatchMode=yes <target> "whoami"
    ```
 
-5. If the agent cannot reach both local machines, provide commands for the user
-   to run locally. Do not pretend Codex Cloud can reach a private LAN.
-
-## Installation order
-
-1. Configure Windows OpenSSH Server from Microsoft's current documentation.
-2. Install the Mac public key in the correct Windows authorized-keys file:
-   - standard user: `%USERPROFILE%\.ssh\authorized_keys`
-   - administrator: `%ProgramData%\ssh\administrators_authorized_keys`
-3. Run `windows/install.ps1` in the logged-in Windows user's PowerShell.
-4. Verify `windows/status.ps1` reports `Running=True` and `SessionId != 0`.
-5. Run `macos/install.zsh <ssh-target>` locally on the Mac.
+3. Run `windows/install.ps1` as the logged-in Windows desktop user.
+4. Require `Running=True` and `SessionId != 0`.
+5. Run `macos/install.zsh <target>` locally on the Mac.
 6. Verify `macos/status.zsh`.
 
-## Acceptance test
+The SSH user and Windows desktop Agent user must be the same account. Codex
+Cloud must not claim it can reach a private LAN unless an explicit runner or
+route has been verified.
 
-- Use random, non-sensitive text generated for the test.
-- Do not read, print, log, save, or upload the pre-existing clipboard.
-- Verify Mac→Windows and Windows→Mac separately.
-- Verify content using a hash or an exact comparison held only in process
-  memory; do not print the text.
-- Verify no echo loop and that queue files return to zero.
-- Verify only one long-running SSH `stream` process exists during normal use.
-- Leave a nonempty test marker in the clipboard rather than clearing it.
+## Safety and acceptance
 
-## Safety and scope
+- Never read, print, log or upload pre-existing clipboard contents.
+- Never request or expose private keys, passwords or tokens.
+- Preserve existing SSH configuration and host-key checking.
+- Do not expose TCP 22 to the public Internet.
+- Use generated, non-sensitive text to test each direction separately.
+- Verify no echo loop, queues eventually return to zero, and one persistent
+  `stream` SSH process carries normal traffic.
+- Do not add files, images, rich text, history, iPhone or cloud features unless
+  scope is explicitly expanded.
+- All changes must remain reversible with the included uninstall scripts.
 
-- Never output credentials, private keys, tokens, or clipboard bodies.
-- Never disable SSH host-key checking.
-- Never expose TCP 22 to the public Internet as part of this project.
-- Do not add image, file, rich-text, history, iPhone, cloud relay, or account
-  features unless the user explicitly expands scope.
-- Preserve unrelated SSH configuration and existing keys.
-- All install changes must be reversible using the included uninstall scripts.
-
-## Definition of done
-
-- PowerShell files parse on Windows PowerShell 5.1.
-- Zsh files pass `zsh -n`; the plist passes `plutil -lint`.
-- The Windows GUI agent has one instance and a nonzero SessionId.
-- One persistent SSH session carries both directions without repeated fetches.
-- Both text directions pass, without an extra reverse event.
-- Queue payloads eventually return to zero after acknowledgement and GUI-agent
-  processing.
-- Documentation states the plaintext-at-rest and latest-state-only limits.
+Before release, run `tests/validate-windows.ps1` and
+`tests/validate-macos.zsh`. These do not replace a real two-GUI-session
+clipboard acceptance test.

@@ -49,7 +49,9 @@ mkdir -p "$HOME/.ssh"
 chmod 700 "$app_dir" "$config_dir"
 chmod 700 "$HOME/.ssh"
 cp "$source_dir/bridge.zsh" "$app_dir/bridge.zsh"
-chmod 700 "$app_dir/bridge.zsh"
+cp "$source_dir/status.zsh" "$app_dir/status.zsh"
+cp "$source_dir/uninstall.zsh" "$app_dir/uninstall.zsh"
+chmod 700 "$app_dir/bridge.zsh" "$app_dir/status.zsh" "$app_dir/uninstall.zsh"
 
 {
   printf 'SSH_TARGET=%q\n' "$ssh_target"

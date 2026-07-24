@@ -1,3 +1,9 @@
+param(
+    [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'MacWindowsSSHClipboard'),
+    [string]$StartupDirectory = [Environment]::GetFolderPath('Startup'),
+    [switch]$NoStart
+)
+
 $ErrorActionPreference = 'Stop'
 
 if ($PSVersionTable.PSVersion -lt [Version]'5.1') {
@@ -10,11 +16,11 @@ if ($null -eq $sshd -or $sshd.Status -ne 'Running') {
 }
 
 $source = $PSScriptRoot
-$root = Join-Path $env:LOCALAPPDATA 'MacWindowsSSHClipboard'
+$root = $InstallRoot
 $inboxRoot = Join-Path $root 'inbox'
 New-Item -ItemType Directory -Force -Path $inboxRoot | Out-Null
 
-foreach ($name in 'agent.ps1', 'remote.ps1', 'start.ps1', 'stop.ps1', 'status.ps1') {
+foreach ($name in 'agent.ps1', 'remote.ps1', 'start.ps1', 'stop.ps1', 'status.ps1', 'uninstall.ps1') {
     Copy-Item -LiteralPath (Join-Path $source $name) -Destination (Join-Path $root $name) -Force
 }
 
@@ -41,8 +47,8 @@ foreach ($identity in $identities) {
 }
 [IO.Directory]::SetAccessControl($root, $security)
 
-$startup = [Environment]::GetFolderPath('Startup')
-$shortcutPath = Join-Path $startup 'MacWindowsSSHClipboard.lnk'
+New-Item -ItemType Directory -Force -Path $StartupDirectory | Out-Null
+$shortcutPath = Join-Path $StartupDirectory 'MacWindowsSSHClipboard.lnk'
 $shell = New-Object -ComObject WScript.Shell
 $shortcut = $shell.CreateShortcut($shortcutPath)
 $shortcut.TargetPath = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
@@ -52,7 +58,12 @@ $shortcut.WindowStyle = 7
 $shortcut.Description = 'Start Mac-Windows SSH Clipboard agent'
 $shortcut.Save()
 
-& (Join-Path $root 'start.ps1')
+if (-not $NoStart) {
+    & (Join-Path $root 'start.ps1')
+}
 Write-Host "Installed to: $root"
-Write-Host 'The agent will start when this Windows user signs in.'
-
+if ($NoStart) {
+    Write-Host 'Files and startup shortcut installed; agent start was intentionally skipped.'
+} else {
+    Write-Host 'The agent will start when this Windows user signs in.'
+}
