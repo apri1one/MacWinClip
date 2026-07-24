@@ -1,0 +1,5 @@
+* text=auto
+*.zsh text eol=lf
+*.plist text eol=lf
+*.ps1 text eol=lf
+*.md text eol=lf
