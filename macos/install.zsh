@@ -40,8 +40,9 @@ if ! xcrun --find swiftc >/dev/null 2>&1; then
   exit 1
 fi
 
+localappdata_command="powershell -NoProfile -NonInteractive -EncodedCommand WwBDAG8AbgBzAG8AbABlAF0AOgA6AE8AdQB0AC4AVwByAGkAdABlACgAJABlAG4AdgA6AEwATwBDAEEATABBAFAAUABEAEEAVABBACkA"
 remote_root="$(ssh -T -o BatchMode=yes -o ConnectTimeout=8 -o ClearAllForwardings=yes \
-  "$ssh_target" 'powershell -NoProfile -Command "[Console]::Out.Write($env:LOCALAPPDATA)"')"
+  "$ssh_target" "$localappdata_command")"
 if [[ -z "$remote_root" ]]; then
   print -u2 -- "Could not discover Windows LOCALAPPDATA."
   exit 1
