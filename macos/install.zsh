@@ -51,7 +51,7 @@ stop_existing_agent() {
   return 1
 }
 
-for command_name in ssh base64 uuidgen xcrun; do
+for command_name in ssh scp base64 uuidgen xcrun; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
     print -u2 -- "Missing command: $command_name"
     exit 1
@@ -69,10 +69,13 @@ if [[ -z "$remote_root" ]]; then
   print -u2 -- "Could not discover Windows LOCALAPPDATA."
   exit 1
 fi
-remote_script="${remote_root}\\MacWindowsSSHClipboard\\remote.ps1"
+remote_install_root="${remote_root}\\MacWindowsSSHClipboard"
+remote_script="${remote_install_root}\\remote.ps1"
+remote_scp_root="${remote_install_root//\\//}"
 health_command="powershell -NoProfile -ExecutionPolicy Bypass -File \"$remote_script\" health"
 health="$(ssh -T -o BatchMode=yes -o ConnectTimeout=8 -o ClearAllForwardings=yes "$ssh_target" "$health_command")"
-if [[ ! "$health" =~ '^OK V2 [1-9][0-9]*$' ]]; then
+health="${health%$'\r'}"
+if [[ ! "$health" =~ '^OK V3 [1-9][0-9]*$' ]]; then
   print -u2 -- "Windows bridge health check failed. Run windows/install.ps1 on Windows first."
   exit 1
 fi
@@ -93,6 +96,7 @@ chmod 700 "$app_dir/clipboard-helper"
 {
   printf 'SSH_TARGET=%q\n' "$ssh_target"
   printf 'WINDOWS_REMOTE_SCRIPT=%q\n' "$remote_script"
+  printf 'WINDOWS_SCP_ROOT=%q\n' "$remote_scp_root"
   printf 'CLIPBOARD_HELPER=%q\n' "$app_dir/clipboard-helper"
   printf 'CLIPBOARD_CHECK_INTERVAL=%q\n' "0.2"
   printf 'RECONNECT_INTERVAL=%q\n' "1"

@@ -14,7 +14,8 @@ if [[ -f "$config" ]]; then
   print -- "ssh_target_configured=yes"
   health_command="powershell -NoProfile -ExecutionPolicy Bypass -File \"$WINDOWS_REMOTE_SCRIPT\" health"
   health="$(ssh -T -o BatchMode=yes -o ConnectTimeout=5 -o ClearAllForwardings=yes "$SSH_TARGET" "$health_command" 2>/dev/null)"
-  if [[ "$health" =~ '^OK V2 [1-9][0-9]*$' ]]; then
+  health="${health%$'\r'}"
+  if [[ "$health" =~ '^OK V3 [1-9][0-9]*$' ]]; then
     print -- "windows_reachable=yes"
   else
     print -- "windows_reachable=no"

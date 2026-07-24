@@ -7,7 +7,10 @@ GUI session and the matching Windows GUI user.
 
 - Detect the current OS before running commands.
 - Mac is the only SSH client; Windows runs OpenSSH Server.
-- Keep one persistent SSH process: Mac→Windows uses stdin, Windows→Mac stdout.
+- Keep one persistent Windows→Mac stdout stream. Mac→Windows payloads use SCP
+  plus a short SSH commit; Windows→Mac acknowledgements use a short SSH action.
+- Do not depend on Windows OpenSSH forwarding stdin to a nested PowerShell
+  process.
 - Never let the Windows SSH/Session 0 process access the desktop clipboard.
 - Only `windows/agent.ps1` in a nonzero desktop SessionId may use
   `Get-Clipboard` or `Set-Clipboard`.
@@ -51,7 +54,7 @@ route has been verified.
 - Use generated, non-sensitive text and test images to test each direction
   separately.
 - Verify no echo loop, queues eventually return to zero, and one persistent
-  `stream` SSH process carries normal traffic.
+  `stream` SSH process carries Windows→Mac traffic without network polling.
 - Do not add files, rich text, history, iPhone or cloud features unless scope
   is explicitly expanded.
 - All changes must remain reversible with the included uninstall scripts.

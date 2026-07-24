@@ -37,8 +37,17 @@ ssh_options=(
   -o ServerAliveCountMax=3
 )
 
-remote_command() {
-  print -r -- "powershell -NoProfile -ExecutionPolicy Bypass -File \"$WINDOWS_REMOTE_SCRIPT\" stream"
+scp_options=(
+  -q
+  -o BatchMode=yes
+  -o ConnectTimeout=5
+  -o ClearAllForwardings=yes
+)
+
+remote_action_command() {
+  local action="$1"
+  shift
+  print -r -- "powershell -NoProfile -ExecutionPolicy Bypass -File \"$WINDOWS_REMOTE_SCRIPT\" $action $*"
 }
 
 clipboard_change_count() {
@@ -54,7 +63,7 @@ type_limit() {
 }
 
 queue_current_clipboard() {
-  local metadata payload_count payload_type payload_size max_bytes encoded message_id
+  local metadata payload_count payload_type payload_size max_bytes message_id
   local -a metadata_parts
 
   metadata="$("$CLIPBOARD_HELPER" export "$outbound_file" 2>/dev/null)" || return 1
@@ -73,7 +82,7 @@ queue_current_clipboard() {
 
   if [[ "$payload_type" == "EMPTY" || "$payload_size" == "0" ]]; then
     pending_id=""
-    pending_frame=""
+    pending_type=""
     rm -f "$outbound_file"
     return 0
   fi
@@ -85,32 +94,56 @@ queue_current_clipboard() {
   max_bytes="$(type_limit "$payload_type")"
   if (( payload_size > max_bytes )); then
     pending_id=""
-    pending_frame=""
+    pending_type=""
     rm -f "$outbound_file"
     return 0
   fi
 
-  encoded="$(base64 < "$outbound_file" | tr -d '\r\n')" || return 1
-  rm -f "$outbound_file"
   message_id="$(uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]')" || return 1
   pending_id="$message_id"
-  pending_frame="SET $message_id $payload_type $encoded"
+  pending_type="$payload_type"
+  pending_retry_ticks=0
+}
+
+send_pending_to_windows() {
+  local type_name remote_upload response
+
+  if [[ -z "$pending_id" || -z "$pending_type" || ! -f "$outbound_file" ]]; then
+    return 1
+  fi
+
+  type_name="${(L)pending_type}"
+  remote_upload="$WINDOWS_SCP_ROOT/upload.$pending_id.$type_name.tmp"
+  scp "${scp_options[@]}" "$outbound_file" "$SSH_TARGET:$remote_upload" || return 1
+
+  response="$(ssh "${ssh_options[@]}" "$SSH_TARGET" \
+    "$(remote_action_command receive "$pending_id" "$pending_type")" 2>/dev/null)" || return 1
+  response="${response%$'\r'}"
+  if [[ "$response" != "ACK $pending_id" ]]; then
+    return 1
+  fi
+
+  pending_id=""
+  pending_type=""
+  rm -f "$outbound_file"
+  return 0
+}
+
+ack_windows_message() {
+  local message_id="$1"
+  local response
+
+  response="$(ssh "${ssh_options[@]}" "$SSH_TARGET" \
+    "$(remote_action_command ack "$message_id")" 2>/dev/null)" || return 1
+  response="${response%$'\r'}"
+  [[ "$response" == "ACK $message_id" ]]
 }
 
 receive_protocol_line() {
   local line="$1"
   local remainder message_id payload_type encoded payload_size max_bytes max_encoded new_count
 
-  if [[ "$line" == ACK\ * ]]; then
-    message_id="${line#ACK }"
-    if [[ "$message_id" == "$pending_id" ]]; then
-      pending_id=""
-      pending_frame=""
-    fi
-    return
-  fi
-
-  if [[ "$line" != SET\ *\ *\ * ]]; then
+  if [[ "$line" == "PING" || "$line" != SET\ *\ *\ * ]]; then
     return
   fi
 
@@ -124,6 +157,11 @@ receive_protocol_line() {
     return
   fi
   if [[ "$payload_type" != "TEXT" && "$payload_type" != "PNG" ]]; then
+    return
+  fi
+
+  if [[ "$message_id" == "$last_received_id" ]]; then
+    ack_windows_message "$message_id" || true
     return
   fi
 
@@ -150,7 +188,8 @@ receive_protocol_line() {
   rm -f "$inbound_file"
   if [[ "$new_count" == <-> ]]; then
     last_change_count="$new_count"
-    print -r -p -- "ACK $message_id"
+    last_received_id="$message_id"
+    ack_windows_message "$message_id" || true
   fi
 }
 
@@ -159,24 +198,31 @@ until last_change_count="$(clipboard_change_count)" && [[ "$last_change_count" =
   sleep 1
 done
 pending_id=""
-pending_frame=""
+pending_type=""
+pending_retry_ticks=0
+last_received_id=""
 
 while true; do
-  coproc ssh "${ssh_options[@]}" "$SSH_TARGET" "$(remote_command)"
+  coproc ssh "${ssh_options[@]}" "$SSH_TARGET" "$(remote_action_command stream)"
   ssh_pid=$!
-  if [[ -n "$pending_frame" ]]; then
-    print -r -p -- "$pending_frame" || true
-  fi
 
   while kill -0 "$ssh_pid" 2>/dev/null; do
     while IFS= read -r -t 0.01 -p protocol_line; do
+      protocol_line="${protocol_line%$'\r'}"
       receive_protocol_line "$protocol_line"
     done
 
     if current_change_count="$(clipboard_change_count)" &&
        [[ "$current_change_count" == <-> && "$current_change_count" != "$last_change_count" ]]; then
-      if queue_current_clipboard && [[ -n "$pending_frame" ]]; then
-        print -r -p -- "$pending_frame" || true
+      queue_current_clipboard || true
+    fi
+
+    if [[ -n "$pending_id" ]]; then
+      if (( pending_retry_ticks <= 0 )); then
+        send_pending_to_windows || true
+        pending_retry_ticks=5
+      else
+        (( pending_retry_ticks -= 1 ))
       fi
     fi
 

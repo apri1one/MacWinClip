@@ -12,17 +12,20 @@
 只需要 **Mac 能 SSH 登录 Windows**。Windows 不需要 SSH 回 Mac，也不需要
 在 Mac 开启“远程登录”。
 
-Mac 保持一条 SSH 长连接：
+Mac 保持一条 Windows→Mac 的 SSH 长连接；反向传输只在剪贴板变化时触发：
 
 ```text
-Mac ── SSH stdin  ──> Windows
-Mac <─ SSH stdout ─── Windows
+Mac <── 持久 SSH stdout ─── Windows
+Mac ── SCP + 短 SSH 提交 ──> Windows
+Mac ── 短 SSH ACK ─────────> Windows
 ```
 
-- 网络层使用同一条全双工连接，不会每隔几百毫秒重新执行 SSH `fetch`；
+- 不会每隔几百毫秒通过网络执行 SSH `fetch`；短 SSH/SCP 会话只在实际复制
+  或确认消息时出现；
 - Mac 每约 0.2 秒、Windows 每约 0.25 秒检查本机剪贴板；
 - Windows SSH 中继每约 0.05 秒检查本机私有队列；
-- 上述检查都发生在本机，发现变化后才写入已打开的 SSH 字节流；
+- 上述检查都发生在本机；Windows 变化写入已打开的 SSH 字节流，Mac 变化
+  通过 SCP 上传后由短 SSH 命令原子提交；
 - `SET/ACK`、断线重连和内容状态抑制用于减少丢失与回环。
 
 Windows 的 SSH 非交互进程通常不能可靠访问桌面剪贴板。因此本项目另有一个
