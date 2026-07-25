@@ -50,9 +50,10 @@ private final class ProgressController: NSObject, NSWindowDelegate {
     private let stateURL: URL
     private let cancelURL: URL
     private let window: NSWindow
+    private let backgroundView = NSVisualEffectView()
     private let directionLabel = NSTextField(labelWithString: "文件传输")
     private let stageLabel = NSTextField(labelWithString: "等待传输状态…")
-    private let percentLabel = NSTextField(labelWithString: "0%")
+    private let percentLabel = NSTextField(labelWithString: "—")
     private let nameLabel = NSTextField(labelWithString: "正在准备文件…")
     private let progress = NSProgressIndicator()
     private let amountLabel = NSTextField(labelWithString: "0 B")
@@ -72,7 +73,7 @@ private final class ProgressController: NSObject, NSWindowDelegate {
         stateURL = URL(fileURLWithPath: stateFile)
         cancelURL = URL(fileURLWithPath: cancelFile)
 
-        let rect = NSRect(x: 0, y: 0, width: 520, height: 318)
+        let rect = NSRect(x: 0, y: 0, width: 540, height: 330)
         window = NSWindow(
             contentRect: rect,
             styleMask: [.titled, .closable, .miniaturizable],
@@ -87,8 +88,7 @@ private final class ProgressController: NSObject, NSWindowDelegate {
 
     func show() {
         window.center()
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        window.orderFront(nil)
         poll()
 
         let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
@@ -107,7 +107,14 @@ private final class ProgressController: NSObject, NSWindowDelegate {
         window.title = "MacWinClip"
         window.isReleasedWhenClosed = false
         window.delegate = self
-        window.backgroundColor = .windowBackgroundColor
+        window.backgroundColor = .clear
+        window.isOpaque = false
+        window.hasShadow = true
+        window.titlebarAppearsTransparent = true
+        backgroundView.material = .windowBackground
+        backgroundView.blendingMode = .behindWindow
+        backgroundView.state = .active
+        window.contentView = backgroundView
     }
 
     private func configureControls() {
@@ -115,29 +122,32 @@ private final class ProgressController: NSObject, NSWindowDelegate {
             return
         }
 
-        directionLabel.frame = NSRect(x: 24, y: 266, width: 350, height: 28)
+        directionLabel.frame = NSRect(x: 28, y: 274, width: 350, height: 28)
         directionLabel.font = .systemFont(ofSize: 17, weight: .semibold)
         directionLabel.lineBreakMode = .byTruncatingTail
+        directionLabel.setAccessibilityRole(.staticText)
         content.addSubview(directionLabel)
 
-        percentLabel.frame = NSRect(x: 398, y: 262, width: 98, height: 34)
-        percentLabel.font = .monospacedDigitSystemFont(ofSize: 23, weight: .medium)
-        percentLabel.textColor = .controlAccentColor
+        percentLabel.frame = NSRect(x: 414, y: 270, width: 98, height: 34)
+        percentLabel.font = .monospacedDigitSystemFont(ofSize: 22, weight: .regular)
+        percentLabel.textColor = .labelColor
         percentLabel.alignment = .right
+        percentLabel.setAccessibilityLabel("传输百分比")
         content.addSubview(percentLabel)
 
-        stageLabel.frame = NSRect(x: 24, y: 245, width: 472, height: 18)
+        stageLabel.frame = NSRect(x: 28, y: 251, width: 484, height: 18)
         stageLabel.font = .systemFont(ofSize: 12)
         stageLabel.textColor = .secondaryLabelColor
         stageLabel.lineBreakMode = .byTruncatingTail
         content.addSubview(stageLabel)
 
-        nameLabel.frame = NSRect(x: 24, y: 210, width: 472, height: 22)
+        nameLabel.frame = NSRect(x: 28, y: 214, width: 484, height: 22)
         nameLabel.font = .systemFont(ofSize: 14, weight: .semibold)
         nameLabel.lineBreakMode = .byTruncatingMiddle
+        nameLabel.setAccessibilityLabel("正在传输的项目")
         content.addSubview(nameLabel)
 
-        progress.frame = NSRect(x: 24, y: 186, width: 472, height: 12)
+        progress.frame = NSRect(x: 28, y: 188, width: 484, height: 12)
         progress.style = .bar
         progress.controlSize = .regular
         progress.minValue = 0
@@ -149,38 +159,39 @@ private final class ProgressController: NSObject, NSWindowDelegate {
         progress.startAnimation(nil)
         content.addSubview(progress)
 
-        amountLabel.frame = NSRect(x: 24, y: 158, width: 230, height: 18)
+        amountLabel.frame = NSRect(x: 28, y: 160, width: 234, height: 18)
         amountLabel.font = .monospacedDigitSystemFont(ofSize: 11.5, weight: .regular)
         amountLabel.textColor = .secondaryLabelColor
         content.addSubview(amountLabel)
 
-        rateLabel.frame = NSRect(x: 254, y: 158, width: 242, height: 18)
+        rateLabel.frame = NSRect(x: 262, y: 160, width: 250, height: 18)
         rateLabel.font = .monospacedDigitSystemFont(ofSize: 11.5, weight: .regular)
         rateLabel.textColor = .secondaryLabelColor
         rateLabel.alignment = .right
         rateLabel.lineBreakMode = .byTruncatingHead
         content.addSubview(rateLabel)
 
-        statusBox.frame = NSRect(x: 24, y: 78, width: 472, height: 66)
+        statusBox.frame = NSRect(x: 28, y: 68, width: 484, height: 78)
         statusBox.boxType = .custom
         statusBox.borderColor = .separatorColor
         statusBox.borderWidth = 1
-        statusBox.cornerRadius = 8
-        statusBox.fillColor = .controlBackgroundColor
+        statusBox.cornerRadius = 10
+        statusBox.fillColor = NSColor.controlBackgroundColor.withAlphaComponent(0.72)
         content.addSubview(statusBox)
 
-        statusTitle.frame = NSRect(x: 13, y: 35, width: 444, height: 19)
+        statusTitle.frame = NSRect(x: 14, y: 45, width: 454, height: 19)
         statusTitle.font = .systemFont(ofSize: 13, weight: .semibold)
         statusTitle.lineBreakMode = .byTruncatingTail
         statusBox.contentView?.addSubview(statusTitle)
 
-        messageLabel.frame = NSRect(x: 13, y: 10, width: 444, height: 18)
+        messageLabel.frame = NSRect(x: 14, y: 8, width: 454, height: 34)
         messageLabel.font = .systemFont(ofSize: 11.5)
         messageLabel.textColor = .secondaryLabelColor
-        messageLabel.lineBreakMode = .byTruncatingTail
+        messageLabel.lineBreakMode = .byWordWrapping
+        messageLabel.maximumNumberOfLines = 2
         statusBox.contentView?.addSubview(messageLabel)
 
-        cancelButton.frame = NSRect(x: 388, y: 20, width: 108, height: 40)
+        cancelButton.frame = NSRect(x: 398, y: 14, width: 114, height: 40)
         cancelButton.bezelStyle = .rounded
         cancelButton.controlSize = .large
         cancelButton.target = self
@@ -241,13 +252,17 @@ private final class ProgressController: NSObject, NSWindowDelegate {
         stageLabel.stringValue = stageText(stage)
         nameLabel.stringValue = name
         statusTitle.stringValue = stageText(stage)
-        messageLabel.stringValue = nonempty(state.message) ?? stageText(stage)
-        percentLabel.stringValue = "\(Int(floor(ratio * 100)))%"
+        messageLabel.stringValue = stageMessage(stage, backendMessage: state.message)
         amountLabel.stringValue = total > 0
             ? "\(formatBytes(transferred)) / \(formatBytes(total))"
             : formatBytes(transferred)
 
-        let indeterminate = !terminal && (total <= 0 || ["preparing", "verifying"].contains(stageKey))
+        let transferStage = ["transferring", "sending", "receiving"].contains(stageKey)
+        let showExactProgress = terminal || (transferStage && total > 0)
+        let indeterminate = !terminal && (
+            ["preparing", "verifying"].contains(stageKey) ||
+            (transferStage && total <= 0)
+        )
         if progress.isIndeterminate != indeterminate {
             progress.isIndeterminate = indeterminate
             if indeterminate {
@@ -256,8 +271,14 @@ private final class ProgressController: NSObject, NSWindowDelegate {
                 progress.stopAnimation(nil)
             }
         }
-        if !indeterminate {
+        if showExactProgress {
             progress.doubleValue = ratio
+            percentLabel.stringValue = "\(Int(floor(ratio * 100)))%"
+        } else {
+            if !indeterminate {
+                progress.doubleValue = 0
+            }
+            percentLabel.stringValue = "—"
         }
 
         if speed > 0, !terminal, transferred < total {
@@ -276,16 +297,17 @@ private final class ProgressController: NSObject, NSWindowDelegate {
             cancelButton.isEnabled = true
             cancelButton.title = "关闭"
             cancelButton.setAccessibilityLabel("关闭文件传输窗口")
-            if terminalAt == nil {
+            if stageKey == "done", terminalAt == nil {
                 terminalAt = now
+            } else if stageKey != "done" {
+                terminalAt = nil
             }
 
             switch stageKey {
             case "done":
-                statusTitle.textColor = .systemGreen
-                if nonempty(state.message) == nil {
-                    messageLabel.stringValue = "文件已保存并写入剪贴板"
-                }
+                statusTitle.textColor = .labelColor
+                statusTitle.stringValue = "文件已准备就绪"
+                messageLabel.stringValue = "可在目标位置查看文件"
             case "canceled", "cancelled":
                 statusTitle.textColor = .secondaryLabelColor
                 if nonempty(state.message) == nil {
@@ -350,6 +372,27 @@ private final class ProgressController: NSObject, NSWindowDelegate {
             return "已取消"
         default:
             return stage.isEmpty ? "等待传输状态…" : stage
+        }
+    }
+
+    private func stageMessage(_ stage: String, backendMessage: String?) -> String {
+        switch stage.lowercased() {
+        case "preparing":
+            return "正在准备要传输的文件；关闭窗口不会取消传输"
+        case "transferring", "sending", "receiving":
+            return "请保持两台电脑在线；关闭窗口不会取消传输"
+        case "verifying":
+            return "正在校验文件完整性；关闭窗口不会取消传输"
+        case "waiting":
+            return "文件已准备好，等待另一台电脑接收；关闭窗口不会取消传输"
+        case "done":
+            return "可在目标位置查看文件"
+        case "canceled", "cancelled":
+            return "传输已取消"
+        case "error":
+            return nonempty(backendMessage) ?? "传输失败"
+        default:
+            return nonempty(backendMessage) ?? stageText(stage)
         }
     }
 
