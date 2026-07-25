@@ -4,6 +4,7 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('mwsc-validation-' + [Guid]::NewGuid().ToString('N'))
 $installRoot = Join-Path $testRoot 'installed'
 $startupRoot = Join-Path $testRoot 'startup'
+$receiveRoot = Join-Path $testRoot 'downloads'
 $process = $null
 
 function Assert-True([bool]$Condition, [string]$Message) {
@@ -51,9 +52,10 @@ try {
     & (Join-Path $projectRoot 'windows\install.ps1') `
         -InstallRoot $installRoot `
         -StartupDirectory $startupRoot `
+        -ReceiveRoot $receiveRoot `
         -NoStart
 
-    foreach ($name in 'agent.ps1', 'remote.ps1', 'start.ps1', 'stop.ps1', 'status.ps1', 'uninstall.ps1') {
+    foreach ($name in 'agent.ps1', 'file-worker.ps1', 'lazy-files.cs', 'progress.ps1', 'remote.ps1', 'start.ps1', 'stop.ps1', 'status.ps1', 'uninstall.ps1', 'receive-root.txt') {
         Assert-True (Test-Path -LiteralPath (Join-Path $installRoot $name)) "Missing installed file: $name"
     }
 
@@ -66,6 +68,7 @@ try {
     & (Join-Path $projectRoot 'windows\install.ps1') `
         -InstallRoot $installRoot `
         -StartupDirectory $startupRoot `
+        -ReceiveRoot $receiveRoot `
         -NoStart `
         -NoAutoStart
     Assert-True (-not (Test-Path -LiteralPath $shortcutPath)) 'NoAutoStart left the startup shortcut installed.'
@@ -90,6 +93,12 @@ try {
     $relayRoot = Join-Path $testRoot 'relay'
     New-Item -ItemType Directory -Path $relayRoot | Out-Null
     Copy-Item -LiteralPath (Join-Path $projectRoot 'windows\remote.ps1') -Destination $relayRoot
+    Copy-Item -LiteralPath (Join-Path $projectRoot 'windows\file-worker.ps1') -Destination $relayRoot
+    [IO.File]::WriteAllText(
+        (Join-Path $relayRoot 'receive-root.txt'),
+        $receiveRoot,
+        [Text.UTF8Encoding]::new($false)
+    )
     $windowsImageId = [Guid]::NewGuid().ToString('N')
     $windowsTextId = [Guid]::NewGuid().ToString('N')
     $macTextId = [Guid]::NewGuid().ToString('N')
@@ -177,6 +186,208 @@ try {
         [Convert]::ToBase64String($receivedBytes) -eq [Convert]::ToBase64String($macImageBytes)
     ) 'Mac-to-Windows image payload mismatch.'
 
+    $windowsFilesId = [Guid]::NewGuid().ToString('N')
+    $fileRequestRoot = Join-Path $relayRoot 'file-requests'
+    New-Item -ItemType Directory -Force -Path $fileRequestRoot | Out-Null
+    $controlledFile = Join-Path $testRoot 'controlled-file.bin'
+    $controlledBytes = [byte[]](0..255)
+    [IO.File]::WriteAllBytes($controlledFile, $controlledBytes)
+    $request = [ordered]@{
+        id = $windowsFilesId
+        sources = @($controlledFile)
+    }
+    [IO.File]::WriteAllText(
+        (Join-Path $fileRequestRoot "$windowsFilesId.json"),
+        ($request | ConvertTo-Json -Compress),
+        [Text.UTF8Encoding]::new($false)
+    )
+    & (Join-Path $relayRoot 'file-worker.ps1') `
+        -Mode PrepareOutbound `
+        -MessageId $windowsFilesId
+
+    $filesMessage = Join-Path $relayRoot "outbound.$windowsFilesId.files.msg"
+    Assert-True (Test-Path -LiteralPath $filesMessage) 'Windows file manifest was not queued.'
+    $filesManifestBytes = [IO.File]::ReadAllBytes($filesMessage)
+    $filesManifest = [Text.Encoding]::UTF8.GetString($filesManifestBytes) | ConvertFrom-Json
+    Assert-True ([int64]$filesManifest.totalBytes -eq $controlledBytes.Length) 'Windows file manifest total is wrong.'
+    $windowsPayload = Join-Path $relayRoot "outgoing\$windowsFilesId\000000.payload"
+    Assert-True (Test-Path -LiteralPath $windowsPayload) 'Windows file payload was not staged.'
+    Assert-True (
+        (Get-FileHash -LiteralPath $windowsPayload -Algorithm SHA256).Hash.ToLowerInvariant() -eq
+        [string]$filesManifest.files[0].sha256
+    ) 'Windows staged file hash is wrong.'
+
+    $expected = 'SET ' + $windowsFilesId + ' FILES ' +
+        [Convert]::ToBase64String($filesManifestBytes)
+    Wait-ForProtocolLine $process $expected 'Windows-to-Mac file manifest frame'
+    $ack = & (Join-Path $relayRoot 'remote.ps1') ack $windowsFilesId
+    Assert-True ($ack -eq "ACK $windowsFilesId") 'Windows file acknowledgement failed.'
+    Assert-True (-not (Test-Path -LiteralPath $windowsPayload)) 'Acknowledged Windows file payload remains.'
+
+    $macFilesId = [Guid]::NewGuid().ToString('N')
+    $macFileHash = [BitConverter]::ToString(
+        [Security.Cryptography.SHA256]::Create().ComputeHash($controlledBytes)
+    ).Replace('-', '').ToLowerInvariant()
+    $macManifest = [ordered]@{
+        version = 1
+        id = $macFilesId
+        totalBytes = $controlledBytes.Length
+        files = @(
+            [ordered]@{
+                index = 0
+                name = 'controlled-file.bin'
+                size = $controlledBytes.Length
+                sha256 = $macFileHash
+            }
+        )
+    }
+    $macOffer = [ordered]@{
+        version = 1
+        id = $macFilesId
+        totalBytes = $controlledBytes.Length
+        files = @(
+            [ordered]@{
+                index = 0
+                name = 'controlled-file.bin'
+                size = $controlledBytes.Length
+                sha256 = ''
+            }
+        )
+    }
+    [IO.File]::WriteAllText(
+        (Join-Path $relayRoot "upload.$macFilesId.files.tmp"),
+        ($macOffer | ConvertTo-Json -Depth 5 -Compress),
+        [Text.UTF8Encoding]::new($false)
+    )
+    $offered = & (Join-Path $relayRoot 'remote.ps1') offer-files $macFilesId
+    Assert-True ($offered -eq "OFFERED $macFilesId") 'Windows did not accept the lazy file offer.'
+    Assert-True (
+        Test-Path -LiteralPath (Join-Path $relayRoot "inbox\$macFilesId.files-offer.msg")
+    ) 'Lazy file offer was not queued for the GUI agent.'
+    Assert-True (
+        -not (Test-Path -LiteralPath (Join-Path $receiveRoot "MacWinClip\$macFilesId"))
+    ) 'File bytes arrived before a paste demand.'
+
+    Add-Type -Path (Join-Path $projectRoot 'windows\lazy-files.cs')
+    $lazyObject = [MacWinClip.LazyFileDataObject]::new(
+        $macFilesId,
+        [string[]]@('controlled-file.bin'),
+        [int64[]]@($controlledBytes.Length),
+        (Join-Path $relayRoot 'file-demands'),
+        (Join-Path $receiveRoot 'MacWinClip'),
+        (Join-Path $testRoot 'no-progress-ui-in-isolated-test.ps1'),
+        (Join-Path $relayRoot 'progress'),
+        (Join-Path $relayRoot 'cancel')
+    )
+    $formatEnumerator = $lazyObject.EnumFormatEtc(
+        [Runtime.InteropServices.ComTypes.DATADIR]::DATADIR_GET
+    )
+    $formats = [Runtime.InteropServices.ComTypes.FORMATETC[]]::new(3)
+    $fetched = [int[]]::new(1)
+    $enumResult = $formatEnumerator.Next(3, $formats, $fetched)
+    Assert-True ($enumResult -eq 0 -and $fetched[0] -eq 3) 'Lazy clipboard formats are incomplete.'
+    $descriptorFormat = $formats[0]
+    $descriptorMedium = [Runtime.InteropServices.ComTypes.STGMEDIUM]::new()
+    $lazyObject.GetData([ref]$descriptorFormat, [ref]$descriptorMedium)
+    Assert-True (
+        -not (Test-Path -LiteralPath (Join-Path $relayRoot "file-demands\$macFilesId.request"))
+    ) 'Reading file metadata incorrectly triggered the file transfer.'
+
+    [IO.File]::WriteAllText(
+        (Join-Path $relayRoot "file-demands\$macFilesId.request"),
+        'fetch',
+        [Text.UTF8Encoding]::new($false)
+    )
+    Wait-ForProtocolLine $process "FETCH $macFilesId" 'Mac-to-Windows lazy file demand'
+
+    [IO.File]::WriteAllText(
+        (Join-Path $relayRoot "upload.$macFilesId.files.tmp"),
+        ($macManifest | ConvertTo-Json -Depth 5 -Compress),
+        [Text.UTF8Encoding]::new($false)
+    )
+    $ready = & (Join-Path $relayRoot 'remote.ps1') begin-files $macFilesId
+    Assert-True ($ready -eq "READY $macFilesId") 'Windows file receiver did not become ready.'
+    $incomingPart = Join-Path $relayRoot "incoming\$macFilesId\000000.part"
+    [IO.File]::WriteAllBytes($incomingPart, $controlledBytes)
+    $partSize = & (Join-Path $relayRoot 'remote.ps1') file-size $macFilesId 0 0
+    Assert-True ([int64]$partSize -eq $controlledBytes.Length) 'Windows incoming file progress is wrong.'
+    $ack = & (Join-Path $relayRoot 'remote.ps1') commit-files $macFilesId
+    Assert-True ($ack -eq "ACK $macFilesId") 'Windows incoming file commit failed.'
+    $fileClipboardMessage = Join-Path $relayRoot "inbox\$macFilesId.files.msg"
+    Assert-True (-not (Test-Path -LiteralPath $fileClipboardMessage)) 'Lazy transfer replaced the virtual clipboard with an eager file list.'
+    Assert-True (
+        Test-Path -LiteralPath (Join-Path $relayRoot "file-demands\$macFilesId.done")
+    ) 'Lazy file completion marker is missing.'
+    $receivedFile = Join-Path $receiveRoot "MacWinClip\$macFilesId\controlled-file.bin"
+    Assert-True (Test-Path -LiteralPath $receivedFile) 'Windows received file is missing.'
+    Assert-True (
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($receivedFile)) -eq
+        [Convert]::ToBase64String($controlledBytes)
+    ) 'Windows received file payload mismatch.'
+    $contentFormat = $formats[1]
+    $contentFormat.lindex = 0
+    $contentMedium = [Runtime.InteropServices.ComTypes.STGMEDIUM]::new()
+    $lazyObject.GetData([ref]$contentFormat, [ref]$contentMedium)
+    Assert-True (
+        $contentMedium.tymed -eq [Runtime.InteropServices.ComTypes.TYMED]::TYMED_ISTREAM -and
+        $contentMedium.unionmember -ne [IntPtr]::Zero
+    ) 'Lazy clipboard did not return a file stream after transfer completion.'
+    [void][Runtime.InteropServices.Marshal]::Release($contentMedium.unionmember)
+
+    $unsafeFilesId = [Guid]::NewGuid().ToString('N')
+    $unsafeManifest = [ordered]@{
+        version = 1
+        id = $unsafeFilesId
+        totalBytes = 1
+        files = @(
+            [ordered]@{
+                index = 0
+                name = '..\escape.bin'
+                size = 1
+                sha256 = ('0' * 64)
+            }
+        )
+    }
+    [IO.File]::WriteAllText(
+        (Join-Path $relayRoot "upload.$unsafeFilesId.files.tmp"),
+        ($unsafeManifest | ConvertTo-Json -Depth 5 -Compress),
+        [Text.UTF8Encoding]::new($false)
+    )
+    $unsafeRejected = $false
+    try {
+        & (Join-Path $relayRoot 'remote.ps1') begin-files $unsafeFilesId
+    } catch {
+        $unsafeRejected = $true
+    }
+    Assert-True $unsafeRejected 'Path traversal file name was accepted.'
+
+    $oversizeFilesId = [Guid]::NewGuid().ToString('N')
+    $oversizeManifest = [ordered]@{
+        version = 1
+        id = $oversizeFilesId
+        totalBytes = 10737418241
+        files = @(
+            [ordered]@{
+                index = 0
+                name = 'oversize.bin'
+                size = 10737418241
+                sha256 = ('0' * 64)
+            }
+        )
+    }
+    [IO.File]::WriteAllText(
+        (Join-Path $relayRoot "upload.$oversizeFilesId.files.tmp"),
+        ($oversizeManifest | ConvertTo-Json -Depth 5 -Compress),
+        [Text.UTF8Encoding]::new($false)
+    )
+    $oversizeRejected = $false
+    try {
+        & (Join-Path $relayRoot 'remote.ps1') begin-files $oversizeFilesId
+    } catch {
+        $oversizeRejected = $true
+    }
+    Assert-True $oversizeRejected 'A file manifest over 10 GiB was accepted.'
+
     if (-not $process.HasExited) {
         $process.Kill()
         [void]$process.WaitForExit(3000)
@@ -190,7 +401,7 @@ try {
     Assert-True (-not (Test-Path -LiteralPath $installRoot)) 'Uninstall left the application directory.'
     Assert-True (-not (Test-Path -LiteralPath $shortcutPath)) 'Uninstall left the startup shortcut.'
 
-    Write-Output 'PASS Windows isolated install, optional autostart, ACL, status, protocol, and uninstall'
+    Write-Output 'PASS Windows isolated install, autostart, ACL, text/image/lazy-file protocol, limits, and uninstall'
 } finally {
     if ($null -ne $process) {
         if (-not $process.HasExited) {

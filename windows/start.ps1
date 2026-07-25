@@ -11,8 +11,10 @@ Start-Process `
     -ArgumentList '-NoProfile', '-Sta', '-ExecutionPolicy', 'Bypass', '-File', $quotedAgent `
     -WindowStyle Hidden
 
-Start-Sleep -Milliseconds 700
 $pidFile = Join-Path $root 'agent.pid'
+for ($attempt = 0; $attempt -lt 50 -and -not (Test-Path -LiteralPath $pidFile); $attempt++) {
+    Start-Sleep -Milliseconds 100
+}
 if (-not (Test-Path -LiteralPath $pidFile)) {
     throw 'Windows clipboard agent did not start.'
 }

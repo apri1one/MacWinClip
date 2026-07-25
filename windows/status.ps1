@@ -1,6 +1,7 @@
 $root = $PSScriptRoot
 $pidFile = Join-Path $root 'agent.pid'
 $inboxRoot = Join-Path $root 'inbox'
+$progressRoot = Join-Path $root 'progress'
 $running = $false
 $agentPid = $null
 
@@ -15,4 +16,14 @@ if (Test-Path -LiteralPath $pidFile) {
     SessionId = if ($running) { (Get-Process -Id $agentPid).SessionId } else { $null }
     PendingMacToWindows = @(Get-ChildItem -LiteralPath $inboxRoot -Filter '*.msg' -File -ErrorAction SilentlyContinue).Count
     PendingWindowsToMac = @(Get-ChildItem -LiteralPath $root -Filter 'outbound.*.msg' -File -ErrorAction SilentlyContinue).Count
+    ActiveFileTransfers = @(
+        Get-ChildItem -LiteralPath $progressRoot -Filter '*.json' -File -ErrorAction SilentlyContinue |
+            Where-Object {
+                try {
+                    (Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json).stage -notin 'Done', 'Error', 'Canceled'
+                } catch {
+                    $false
+                }
+            }
+    ).Count
 }

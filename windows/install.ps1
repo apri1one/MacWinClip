@@ -1,6 +1,7 @@
 param(
     [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'MacWindowsSSHClipboard'),
     [string]$StartupDirectory = [Environment]::GetFolderPath('Startup'),
+    [string]$ReceiveRoot = (Join-Path ([Environment]::GetFolderPath('UserProfile')) 'Downloads'),
     [switch]$NoStart,
     [switch]$NoAutoStart
 )
@@ -19,6 +20,7 @@ if ($null -eq $sshd -or $sshd.Status -ne 'Running') {
 $source = $PSScriptRoot
 $root = $InstallRoot
 $inboxRoot = Join-Path $root 'inbox'
+$resolvedReceiveRoot = [IO.Path]::GetFullPath($ReceiveRoot)
 
 $existingStop = Join-Path $root 'stop.ps1'
 if (Test-Path -LiteralPath $existingStop) {
@@ -27,9 +29,14 @@ if (Test-Path -LiteralPath $existingStop) {
 
 New-Item -ItemType Directory -Force -Path $inboxRoot | Out-Null
 
-foreach ($name in 'agent.ps1', 'remote.ps1', 'start.ps1', 'stop.ps1', 'status.ps1', 'uninstall.ps1') {
+foreach ($name in 'agent.ps1', 'file-worker.ps1', 'lazy-files.cs', 'progress.ps1', 'remote.ps1', 'start.ps1', 'stop.ps1', 'status.ps1', 'uninstall.ps1') {
     Copy-Item -LiteralPath (Join-Path $source $name) -Destination (Join-Path $root $name) -Force
 }
+[IO.File]::WriteAllText(
+    (Join-Path $root 'receive-root.txt'),
+    $resolvedReceiveRoot,
+    [Text.UTF8Encoding]::new($false)
+)
 
 $security = [Security.AccessControl.DirectorySecurity]::new()
 $security.SetAccessRuleProtection($true, $false)
