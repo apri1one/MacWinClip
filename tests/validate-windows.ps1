@@ -189,7 +189,10 @@ try {
     $windowsFilesId = [Guid]::NewGuid().ToString('N')
     $fileRequestRoot = Join-Path $relayRoot 'file-requests'
     New-Item -ItemType Directory -Force -Path $fileRequestRoot | Out-Null
-    $controlledFile = Join-Path $testRoot 'controlled-file.bin'
+    $unicodeFileName = [Text.RegularExpressions.Regex]::Unescape(
+        '\u5496\u5561\u5e97\u8bc4\u5206\u8868.csv'
+    )
+    $controlledFile = Join-Path $testRoot $unicodeFileName
     $controlledBytes = [byte[]](0..255)
     [IO.File]::WriteAllBytes($controlledFile, $controlledBytes)
     $request = [ordered]@{
@@ -210,6 +213,7 @@ try {
     $filesManifestBytes = [IO.File]::ReadAllBytes($filesMessage)
     $filesManifest = [Text.Encoding]::UTF8.GetString($filesManifestBytes) | ConvertFrom-Json
     Assert-True ([int64]$filesManifest.totalBytes -eq $controlledBytes.Length) 'Windows file manifest total is wrong.'
+    Assert-True ([string]$filesManifest.files[0].name -eq $unicodeFileName) 'Windows Unicode file name was corrupted.'
     $windowsPayload = Join-Path $relayRoot "outgoing\$windowsFilesId\000000.payload"
     Assert-True (Test-Path -LiteralPath $windowsPayload) 'Windows file payload was not staged.'
     Assert-True (
@@ -235,7 +239,7 @@ try {
         files = @(
             [ordered]@{
                 index = 0
-                name = 'controlled-file.bin'
+                name = $unicodeFileName
                 size = $controlledBytes.Length
                 sha256 = $macFileHash
             }
@@ -248,7 +252,7 @@ try {
         files = @(
             [ordered]@{
                 index = 0
-                name = 'controlled-file.bin'
+                name = $unicodeFileName
                 size = $controlledBytes.Length
                 sha256 = ''
             }
@@ -271,7 +275,7 @@ try {
     Add-Type -Path (Join-Path $projectRoot 'windows\lazy-files.cs')
     $lazyObject = [MacWinClip.LazyFileDataObject]::new(
         $macFilesId,
-        [string[]]@('controlled-file.bin'),
+        [string[]]@($unicodeFileName),
         [int64[]]@($controlledBytes.Length),
         (Join-Path $relayRoot 'file-demands'),
         (Join-Path $receiveRoot 'MacWinClip'),
@@ -318,12 +322,16 @@ try {
     Assert-True (
         Test-Path -LiteralPath (Join-Path $relayRoot "file-demands\$macFilesId.done")
     ) 'Lazy file completion marker is missing.'
-    $receivedFile = Join-Path $receiveRoot "MacWinClip\$macFilesId\controlled-file.bin"
+    $receivedFile = Join-Path (Join-Path $receiveRoot "MacWinClip\$macFilesId") $unicodeFileName
     Assert-True (Test-Path -LiteralPath $receivedFile) 'Windows received file is missing.'
     Assert-True (
         [Convert]::ToBase64String([IO.File]::ReadAllBytes($receivedFile)) -eq
         [Convert]::ToBase64String($controlledBytes)
     ) 'Windows received file payload mismatch.'
+    $unicodeState = Get-Content -LiteralPath (Join-Path $relayRoot "progress\$macFilesId.json") `
+        -Raw -Encoding UTF8 |
+        ConvertFrom-Json
+    Assert-True ([string]$unicodeState.name -eq $unicodeFileName) 'Windows progress state corrupted a Unicode file name.'
     $contentFormat = $formats[1]
     $contentFormat.lindex = 0
     $contentMedium = [Runtime.InteropServices.ComTypes.STGMEDIUM]::new()

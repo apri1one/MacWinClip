@@ -126,7 +126,7 @@ try {
         throw 'File transfer request is missing.'
     }
 
-    $request = Get-Content -LiteralPath $requestPath -Raw | ConvertFrom-Json
+    $request = Get-Content -LiteralPath $requestPath -Raw -Encoding UTF8 | ConvertFrom-Json
     $sources = @($request.sources)
     if ($sources.Count -eq 0 -or $sources.Count -gt 1000) {
         throw 'File selection must contain between 1 and 1000 files.'

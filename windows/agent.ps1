@@ -182,7 +182,7 @@ function Set-LazyFileOffer([string]$MessageId, [byte[]]$Bytes) {
         Remove-Item -LiteralPath (Join-Path $demandRoot "$MessageId.$suffix") -Force -ErrorAction SilentlyContinue
     }
     $receiveRoot = [IO.Path]::GetFullPath(
-        (Get-Content -LiteralPath $receiveRootFile -Raw).Trim()
+        (Get-Content -LiteralPath $receiveRootFile -Raw -Encoding UTF8).Trim()
     )
     $destinationRoot = Join-Path $receiveRoot 'MacWinClip'
     $script:lazyFileClipboard = [MacWinClip.LazyFileClipboard]::Set(
@@ -283,7 +283,8 @@ function Remove-ExpiredProgressState {
             continue
         }
         try {
-            $state = Get-Content -LiteralPath $stateFile.FullName -Raw | ConvertFrom-Json
+            $state = Get-Content -LiteralPath $stateFile.FullName -Raw -Encoding UTF8 |
+                ConvertFrom-Json
             if ($state.stage -in 'Done', 'Error', 'Canceled') {
                 $id = [IO.Path]::GetFileNameWithoutExtension($stateFile.Name)
                 Remove-Item -LiteralPath $stateFile.FullName -Force
@@ -341,7 +342,8 @@ try {
                 if ($type -eq 'FILES') {
                     $statePath = Join-Path $progressRoot "$messageId.json"
                     if (Test-Path -LiteralPath $statePath) {
-                        $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+                        $state = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 |
+                            ConvertFrom-Json
                         $state.stage = 'Done'
                         $state.transferred = [int64]$state.total
                         $state.message = 'Transfer complete.'

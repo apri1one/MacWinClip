@@ -104,7 +104,7 @@ function Read-State([string]$Id) {
     if (-not (Test-Path -LiteralPath $path)) {
         return $null
     }
-    return Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+    return Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
 }
 
 function Remove-Outbound([string]$Id) {
@@ -127,7 +127,7 @@ function Read-Manifest(
         throw 'File manifest size is invalid.'
     }
 
-    $manifest = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    $manifest = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
     if ([int]$manifest.version -ne 1 -or [string]$manifest.id -ne $ExpectedId) {
         throw 'File manifest version or id is invalid.'
     }
@@ -414,7 +414,9 @@ if ($Action -eq 'commit-files') {
     if (-not (Test-Path -LiteralPath $receiveRootFile -PathType Leaf)) {
         throw 'Receive directory configuration is missing.'
     }
-    $receiveRoot = [IO.Path]::GetFullPath((Get-Content -LiteralPath $receiveRootFile -Raw).Trim())
+    $receiveRoot = [IO.Path]::GetFullPath(
+        (Get-Content -LiteralPath $receiveRootFile -Raw -Encoding UTF8).Trim()
+    )
     if ([string]::IsNullOrWhiteSpace($receiveRoot)) {
         throw 'Receive directory configuration is invalid.'
     }

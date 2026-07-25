@@ -20,7 +20,10 @@ if (Test-Path -LiteralPath $pidFile) {
         Get-ChildItem -LiteralPath $progressRoot -Filter '*.json' -File -ErrorAction SilentlyContinue |
             Where-Object {
                 try {
-                    (Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json).stage -notin 'Done', 'Error', 'Canceled'
+                    (
+                        Get-Content -LiteralPath $_.FullName -Raw -Encoding UTF8 |
+                            ConvertFrom-Json
+                    ).stage -notin 'Done', 'Error', 'Canceled'
                 } catch {
                     $false
                 }
