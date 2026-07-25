@@ -10,6 +10,21 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+Add-Type -TypeDefinition @'
+using System.Windows.Forms;
+
+namespace MacWinClip
+{
+    public sealed class PassiveProgressForm : Form
+    {
+        protected override bool ShowWithoutActivation
+        {
+            get { return true; }
+        }
+    }
+}
+'@ -ReferencedAssemblies 'System.Windows.Forms'
+
 if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
     throw 'Progress UI must run in an STA PowerShell process.'
 }
@@ -40,8 +55,10 @@ $Text = @{
     TransferringMessage = U '\u8bf7\u4fdd\u6301\u4e24\u53f0\u7535\u8111\u5728\u7ebf\uff0c\u6587\u672c\u548c\u622a\u56fe\u540c\u6b65\u4e0d\u53d7\u5f71\u54cd'
     VerifyingMessage = U '\u6b63\u5728\u6821\u9a8c\u6587\u4ef6\u5b8c\u6574\u6027\u2026'
     WaitingMessage = U '\u6587\u4ef6\u5df2\u51c6\u5907\u597d\uff0c\u7b49\u5f85\u53e6\u4e00\u53f0\u7535\u8111\u63a5\u6536\u2026'
-    CompletedMessage = U '\u6587\u4ef6\u5df2\u4fdd\u5b58\u5e76\u5199\u5165\u526a\u8d34\u677f'
+    CompletedMessage = U '\u53ef\u5728\u76ee\u6807\u4f4d\u7f6e\u67e5\u770b\u6587\u4ef6'
     CanceledMessage = U '\u4f20\u8f93\u5df2\u53d6\u6d88'
+    CloseHint = U '\u5173\u95ed\u7a97\u53e3\u4e0d\u4f1a\u53d6\u6d88\u4f20\u8f93'
+    ProgressAccessibility = U '\u6587\u4ef6\u4f20\u8f93\u8fdb\u5ea6'
     NoName = U '\u6b63\u5728\u51c6\u5907\u6587\u4ef6\u2026'
     Hours = U '\u5c0f\u65f6'
     Minutes = U '\u5206'
@@ -131,106 +148,119 @@ function Get-StageMessage([string]$Stage, [string]$BackendMessage) {
 
 [Windows.Forms.Application]::EnableVisualStyles()
 
-$form = [Windows.Forms.Form]::new()
+$form = [MacWinClip.PassiveProgressForm]::new()
 $form.Text = 'MacWinClip'
-$form.ClientSize = [Drawing.Size]::new(520, 318)
+$form.ClientSize = [Drawing.Size]::new(560, 360)
 $form.FormBorderStyle = [Windows.Forms.FormBorderStyle]::FixedDialog
 $form.MaximizeBox = $false
 $form.MinimizeBox = $true
 $form.StartPosition = [Windows.Forms.FormStartPosition]::CenterScreen
 $form.AutoScaleMode = [Windows.Forms.AutoScaleMode]::Dpi
-$form.BackColor = [Drawing.Color]::FromArgb(251, 251, 251)
+$form.AutoScaleDimensions = [Drawing.SizeF]::new(96, 96)
+$form.BackColor = [Drawing.Color]::FromArgb(243, 244, 246)
 $form.ShowInTaskbar = $true
 
+$card = [Windows.Forms.Panel]::new()
+$card.Location = [Drawing.Point]::new(20, 18)
+$card.Size = [Drawing.Size]::new(520, 264)
+$card.BackColor = [Drawing.Color]::White
+$card.BorderStyle = [Windows.Forms.BorderStyle]::FixedSingle
+$form.Controls.Add($card)
+
 $directionLabel = [Windows.Forms.Label]::new()
-$directionLabel.Location = [Drawing.Point]::new(24, 22)
-$directionLabel.Size = [Drawing.Size]::new(360, 28)
+$directionLabel.Location = [Drawing.Point]::new(20, 18)
+$directionLabel.Size = [Drawing.Size]::new(370, 28)
 $directionLabel.Font = [Drawing.Font]::new('Segoe UI', 12, [Drawing.FontStyle]::Bold)
 $directionLabel.Text = $Text.FileTransfer
-$form.Controls.Add($directionLabel)
+$card.Controls.Add($directionLabel)
 
 $percentLabel = [Windows.Forms.Label]::new()
-$percentLabel.Location = [Drawing.Point]::new(400, 18)
+$percentLabel.Location = [Drawing.Point]::new(402, 14)
 $percentLabel.Size = [Drawing.Size]::new(96, 34)
-$percentLabel.Font = [Drawing.Font]::new('Segoe UI', 17, [Drawing.FontStyle]::Regular)
-$percentLabel.ForeColor = [Drawing.Color]::FromArgb(15, 108, 189)
+$percentLabel.Font = [Drawing.Font]::new('Segoe UI Variable Display', 16, [Drawing.FontStyle]::Regular)
+$percentLabel.ForeColor = [Drawing.Color]::FromArgb(45, 45, 45)
 $percentLabel.TextAlign = [Drawing.ContentAlignment]::MiddleRight
-$percentLabel.Text = '0%'
-$form.Controls.Add($percentLabel)
+$percentLabel.Text = [char]0x2014
+$card.Controls.Add($percentLabel)
 
 $stageLabel = [Windows.Forms.Label]::new()
-$stageLabel.Location = [Drawing.Point]::new(24, 51)
-$stageLabel.Size = [Drawing.Size]::new(472, 20)
+$stageLabel.Location = [Drawing.Point]::new(20, 48)
+$stageLabel.Size = [Drawing.Size]::new(478, 20)
 $stageLabel.Font = [Drawing.Font]::new('Segoe UI', 8.5)
-$stageLabel.ForeColor = [Drawing.Color]::FromArgb(93, 93, 93)
+$stageLabel.ForeColor = [Drawing.Color]::FromArgb(96, 96, 96)
 $stageLabel.Text = $Text.WaitingForState
-$form.Controls.Add($stageLabel)
+$card.Controls.Add($stageLabel)
 
 $fileLabel = [Windows.Forms.Label]::new()
-$fileLabel.Location = [Drawing.Point]::new(24, 82)
-$fileLabel.Size = [Drawing.Size]::new(472, 24)
+$fileLabel.Location = [Drawing.Point]::new(20, 79)
+$fileLabel.Size = [Drawing.Size]::new(478, 24)
 $fileLabel.Font = [Drawing.Font]::new('Segoe UI', 9.5, [Drawing.FontStyle]::Bold)
 $fileLabel.AutoEllipsis = $true
 $fileLabel.Text = $Text.NoName
-$form.Controls.Add($fileLabel)
+$card.Controls.Add($fileLabel)
 
-$bar = [Windows.Forms.ProgressBar]::new()
-$bar.Location = [Drawing.Point]::new(24, 115)
-$bar.Size = [Drawing.Size]::new(472, 10)
-$bar.Minimum = 0
-$bar.Maximum = 1000
-$bar.Style = [Windows.Forms.ProgressBarStyle]::Marquee
-$bar.MarqueeAnimationSpeed = 28
-$form.Controls.Add($bar)
+$barTrack = [Windows.Forms.Panel]::new()
+$barTrack.Location = [Drawing.Point]::new(20, 112)
+$barTrack.Size = [Drawing.Size]::new(478, 8)
+$barTrack.BackColor = [Drawing.Color]::FromArgb(225, 227, 230)
+$barTrack.AccessibleRole = [Windows.Forms.AccessibleRole]::ProgressBar
+$barTrack.AccessibleName = $Text.ProgressAccessibility
+$card.Controls.Add($barTrack)
+
+$barFill = [Windows.Forms.Panel]::new()
+$barFill.Location = [Drawing.Point]::new(0, 0)
+$barFill.Size = [Drawing.Size]::new(0, 8)
+$barFill.BackColor = [Drawing.Color]::FromArgb(75, 85, 91)
+$barTrack.Controls.Add($barFill)
 
 $amountLabel = [Windows.Forms.Label]::new()
-$amountLabel.Location = [Drawing.Point]::new(24, 135)
+$amountLabel.Location = [Drawing.Point]::new(20, 130)
 $amountLabel.Size = [Drawing.Size]::new(230, 20)
 $amountLabel.Font = [Drawing.Font]::new('Segoe UI', 8.5)
-$amountLabel.ForeColor = [Drawing.Color]::FromArgb(93, 93, 93)
+$amountLabel.ForeColor = [Drawing.Color]::FromArgb(96, 96, 96)
 $amountLabel.Text = '0 B'
-$form.Controls.Add($amountLabel)
+$card.Controls.Add($amountLabel)
 
 $rateLabel = [Windows.Forms.Label]::new()
-$rateLabel.Location = [Drawing.Point]::new(254, 135)
-$rateLabel.Size = [Drawing.Size]::new(242, 20)
+$rateLabel.Location = [Drawing.Point]::new(250, 130)
+$rateLabel.Size = [Drawing.Size]::new(248, 20)
 $rateLabel.Font = [Drawing.Font]::new('Segoe UI', 8.5)
-$rateLabel.ForeColor = [Drawing.Color]::FromArgb(93, 93, 93)
+$rateLabel.ForeColor = [Drawing.Color]::FromArgb(96, 96, 96)
 $rateLabel.TextAlign = [Drawing.ContentAlignment]::MiddleRight
 $rateLabel.Text = $Text.Calculating
-$form.Controls.Add($rateLabel)
+$card.Controls.Add($rateLabel)
 
 $statusPanel = [Windows.Forms.Panel]::new()
-$statusPanel.Location = [Drawing.Point]::new(24, 166)
-$statusPanel.Size = [Drawing.Size]::new(472, 70)
+$statusPanel.Location = [Drawing.Point]::new(20, 162)
+$statusPanel.Size = [Drawing.Size]::new(478, 80)
 $statusPanel.BorderStyle = [Windows.Forms.BorderStyle]::FixedSingle
-$statusPanel.BackColor = [Drawing.Color]::FromArgb(240, 247, 252)
-$form.Controls.Add($statusPanel)
+$statusPanel.BackColor = [Drawing.Color]::FromArgb(247, 247, 248)
+$card.Controls.Add($statusPanel)
 
 $statusTitle = [Windows.Forms.Label]::new()
 $statusTitle.Location = [Drawing.Point]::new(12, 8)
 $statusTitle.Size = [Drawing.Size]::new(446, 20)
 $statusTitle.Font = [Drawing.Font]::new('Segoe UI', 9, [Drawing.FontStyle]::Bold)
-$statusTitle.ForeColor = [Drawing.Color]::FromArgb(23, 58, 85)
+$statusTitle.ForeColor = [Drawing.Color]::FromArgb(45, 45, 45)
 $statusTitle.Text = $Text.WaitingForState
 $statusPanel.Controls.Add($statusTitle)
 
 $messageLabel = [Windows.Forms.Label]::new()
-$messageLabel.Location = [Drawing.Point]::new(12, 31)
-$messageLabel.Size = [Drawing.Size]::new(446, 30)
+$messageLabel.Location = [Drawing.Point]::new(12, 32)
+$messageLabel.Size = [Drawing.Size]::new(452, 40)
 $messageLabel.Font = [Drawing.Font]::new('Segoe UI', 8.5)
-$messageLabel.ForeColor = [Drawing.Color]::FromArgb(93, 93, 93)
-$messageLabel.AutoEllipsis = $true
+$messageLabel.ForeColor = [Drawing.Color]::FromArgb(96, 96, 96)
+$messageLabel.AutoEllipsis = $false
 $messageLabel.Text = $Text.WaitingForState
 $statusPanel.Controls.Add($messageLabel)
 
 $cancelButton = [Windows.Forms.Button]::new()
 $cancelButton.Text = $Text.Cancel
-$cancelButton.Location = [Drawing.Point]::new(378, 252)
-$cancelButton.Size = [Drawing.Size]::new(118, 44)
+$cancelButton.Location = [Drawing.Point]::new(412, 298)
+$cancelButton.Size = [Drawing.Size]::new(128, 44)
 $cancelButton.UseVisualStyleBackColor = $true
 $form.AcceptButton = $null
-$form.CancelButton = $cancelButton
+$form.CancelButton = $null
 $form.Controls.Add($cancelButton)
 
 $script:samples = [Collections.Generic.List[object]]::new()
@@ -238,6 +268,7 @@ $script:lastTransferred = [int64]-1
 $script:lastName = ''
 $script:terminalAt = $null
 $script:terminalState = $false
+$script:marqueeOffset = -96
 
 function Reset-Samples([int64]$Transferred, [string]$Name, [DateTime]$Now) {
     $script:samples.Clear()
@@ -338,22 +369,39 @@ $timer.Add_Tick({
             $ratio = 1
         }
 
-        $percentLabel.Text = '{0}%' -f [Math]::Floor($ratio * 100)
         $amountLabel.Text = if ($total -gt 0) {
             "$(Format-Bytes $transferred) / $(Format-Bytes $total)"
         } else {
             Format-Bytes $transferred
         }
 
+        $transferStage = $stageKey -in 'transferring', 'sending', 'receiving'
+        $showExactProgress = $terminal -or ($transferStage -and $total -gt 0)
         $indeterminate = -not $terminal -and (
-            $total -le 0 -or $stageKey -in 'preparing', 'verifying'
+            $stageKey -in 'preparing', 'verifying' -or
+            ($transferStage -and $total -le 0)
         )
         if ($indeterminate) {
-            $bar.Style = [Windows.Forms.ProgressBarStyle]::Marquee
+            $percentLabel.Text = [char]0x2014
+            $barFill.Width = 96
+            $script:marqueeOffset += 28
+            if ($script:marqueeOffset -gt $barTrack.ClientSize.Width) {
+                $script:marqueeOffset = -96
+            }
+            $barFill.Left = $script:marqueeOffset
+        } elseif ($showExactProgress) {
+            $percentLabel.Text = '{0}%' -f [Math]::Floor($ratio * 100)
+            $barFill.Left = 0
+            $barFill.Width = [Math]::Min(
+                $barTrack.ClientSize.Width,
+                [Math]::Max(0, [int][Math]::Round($ratio * $barTrack.ClientSize.Width))
+            )
         } else {
-            $bar.Style = [Windows.Forms.ProgressBarStyle]::Continuous
-            $bar.Value = [Math]::Min(1000, [Math]::Max(0, [int][Math]::Round($ratio * 1000)))
+            $percentLabel.Text = [char]0x2014
+            $barFill.Left = 0
+            $barFill.Width = 0
         }
+        $barTrack.AccessibleDescription = $percentLabel.Text
 
         if ($speed -gt 0 -and -not $terminal -and $transferred -lt $total) {
             $eta = Format-Duration (($total - $transferred) / $speed)
@@ -370,29 +418,34 @@ $timer.Add_Tick({
             $script:terminalState = $true
             $cancelButton.Enabled = $true
             $cancelButton.Text = $Text.Close
-            if ($null -eq $script:terminalAt) {
+            if ($stageKey -eq 'done' -and $null -eq $script:terminalAt) {
                 $script:terminalAt = $now
+            } elseif ($stageKey -ne 'done') {
+                $script:terminalAt = $null
             }
 
             switch ($stageKey) {
                 'done' {
-                    $statusTitle.ForeColor = [Drawing.Color]::FromArgb(15, 123, 15)
-                    $statusPanel.BackColor = [Drawing.Color]::FromArgb(239, 248, 239)
+                    $statusTitle.ForeColor = [Drawing.Color]::FromArgb(45, 45, 45)
+                    $statusPanel.BackColor = [Drawing.Color]::FromArgb(247, 247, 248)
                 }
                 { $_ -in 'canceled', 'cancelled' } {
-                    $statusTitle.ForeColor = [Drawing.Color]::FromArgb(93, 93, 93)
-                    $statusPanel.BackColor = [Drawing.Color]::FromArgb(245, 245, 245)
+                    $statusTitle.ForeColor = [Drawing.Color]::FromArgb(96, 96, 96)
+                    $statusPanel.BackColor = [Drawing.Color]::FromArgb(247, 247, 248)
                 }
                 default {
                     $statusTitle.ForeColor = [Drawing.Color]::FromArgb(196, 43, 28)
-                    $statusPanel.BackColor = [Drawing.Color]::FromArgb(253, 240, 238)
+                    $statusPanel.BackColor = [Drawing.Color]::FromArgb(255, 247, 246)
                 }
             }
         } else {
             $script:terminalState = $false
             $script:terminalAt = $null
-            $statusTitle.ForeColor = [Drawing.Color]::FromArgb(23, 58, 85)
-            $statusPanel.BackColor = [Drawing.Color]::FromArgb(240, 247, 252)
+            $statusTitle.ForeColor = [Drawing.Color]::FromArgb(45, 45, 45)
+            $statusPanel.BackColor = [Drawing.Color]::FromArgb(247, 247, 248)
+            if ($stageKey -in 'preparing', 'transferring', 'sending', 'receiving', 'verifying', 'waiting') {
+                $messageLabel.Text = "$(Get-StageMessage $stage $message)`r`n$($Text.CloseHint)"
+            }
         }
     } catch {
         # A state writer may be replacing the file. Keep the last valid frame.
@@ -404,4 +457,4 @@ $form.Add_FormClosed({
     $timer.Stop()
     $timer.Dispose()
 })
-[void]$form.ShowDialog()
+[Windows.Forms.Application]::Run($form)
