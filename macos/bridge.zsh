@@ -109,6 +109,7 @@ queue_current_clipboard() {
     return 1
   fi
   last_change_count="$payload_count"
+  drop_file_offer
 
   if [[ "$payload_type" == "EMPTY" || "$payload_size" == "0" ]]; then
     pending_id=""
@@ -121,7 +122,6 @@ queue_current_clipboard() {
     return 1
   fi
 
-  drop_file_offer
   if [[ "$payload_type" == "FILES" ]]; then
     if (( payload_size > ${MAX_FILE_BYTES:-10737418240} )); then
       rm -f "$outbound_file"
@@ -169,19 +169,53 @@ queue_current_clipboard() {
 }
 
 drop_file_offer() {
-  local response
+  local drop_id response
 
-  if [[ -z "$file_offer_id" ]]; then
+  drop_id="$remote_file_clipboard_id"
+  if [[ -z "$drop_id" ]]; then
+    drop_id="$file_offer_id"
+  fi
+  if [[ -z "$drop_id" ]]; then
     return 0
   fi
+  remote_file_drop_pending=1
   response="$(ssh "${ssh_options[@]}" "$SSH_TARGET" \
-    "$(remote_action_command drop-offer "$file_offer_id")" 2>/dev/null)" || true
+    "$(remote_action_command drop-offer "$drop_id")" 2>/dev/null)" || true
+  response="${response%$'\r'}"
   rm -f "$file_offer_private" "$file_offer_public"
   file_offer_id=""
   file_offer_private=""
   file_offer_public=""
   file_offer_retry_ticks=0
   file_offer_announced=0
+  if [[ "$response" == "ACK $drop_id" ]]; then
+    if [[ "$remote_file_clipboard_id" == "$drop_id" ]]; then
+      remote_file_clipboard_id=""
+    fi
+    remote_file_drop_pending=0
+    remote_file_drop_retry_ticks=0
+  else
+    remote_file_drop_retry_ticks=5
+  fi
+}
+
+retry_remote_file_drop() {
+  local drop_id response
+
+  if [[ "$remote_file_drop_pending" != "1" || -z "$remote_file_clipboard_id" ]]; then
+    return 0
+  fi
+  drop_id="$remote_file_clipboard_id"
+  response="$(ssh "${ssh_options[@]}" "$SSH_TARGET" \
+    "$(remote_action_command drop-offer "$drop_id")" 2>/dev/null)" || return 1
+  response="${response%$'\r'}"
+  if [[ "$response" == "ACK $drop_id" && "$remote_file_clipboard_id" == "$drop_id" ]]; then
+    remote_file_clipboard_id=""
+    remote_file_drop_pending=0
+    remote_file_drop_retry_ticks=0
+    return 0
+  fi
+  return 1
 }
 
 send_file_offer() {
@@ -197,6 +231,9 @@ send_file_offer() {
   response="${response%$'\r'}"
   if [[ "$response" == "OFFERED $file_offer_id" ]]; then
     file_offer_announced=1
+    remote_file_clipboard_id="$file_offer_id"
+    remote_file_drop_pending=0
+    remote_file_drop_retry_ticks=0
     return 0
   fi
   return 1
@@ -260,6 +297,11 @@ receive_protocol_line() {
 
   if [[ "$line" == DISMISS\ [a-f0-9]## ]]; then
     message_id="${line#DISMISS }"
+    if [[ ${#message_id} -eq 32 && "$message_id" == "$remote_file_clipboard_id" ]]; then
+      remote_file_clipboard_id=""
+      remote_file_drop_pending=0
+      remote_file_drop_retry_ticks=0
+    fi
     if [[ ${#message_id} -eq 32 && "$message_id" == "$file_offer_id" ]]; then
       rm -f "$file_offer_private" "$file_offer_public"
       file_offer_id=""
@@ -384,6 +426,9 @@ file_offer_private=""
 file_offer_public=""
 file_offer_retry_ticks=0
 file_offer_announced=0
+remote_file_clipboard_id=""
+remote_file_drop_pending=0
+remote_file_drop_retry_ticks=0
 last_received_id=""
 active_receive_id=""
 
@@ -419,6 +464,14 @@ while true; do
         file_offer_retry_ticks=5
       else
         (( file_offer_retry_ticks -= 1 ))
+      fi
+    fi
+    if [[ "$remote_file_drop_pending" == "1" && -z "$file_offer_id" ]]; then
+      if (( remote_file_drop_retry_ticks <= 0 )); then
+        retry_remote_file_drop || true
+        remote_file_drop_retry_ticks=5
+      else
+        (( remote_file_drop_retry_ticks -= 1 ))
       fi
     fi
 

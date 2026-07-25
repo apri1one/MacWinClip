@@ -267,6 +267,14 @@ if ($Action -eq 'drop-offer') {
         'dismissed',
         [Text.UTF8Encoding]::new($false)
     )
+    $temporary = Join-Path $inboxRoot "$MessageId.files-dismiss.tmp"
+    $message = Join-Path $inboxRoot "$MessageId.files-dismiss.msg"
+    [IO.File]::WriteAllText(
+        $temporary,
+        'dismiss',
+        [Text.UTF8Encoding]::new($false)
+    )
+    Move-Item -LiteralPath $temporary -Destination $message -Force
     Write-Output "ACK $MessageId"
     exit 0
 }

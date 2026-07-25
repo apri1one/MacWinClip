@@ -288,22 +288,32 @@ func exportClipboard(to path: String) throws {
         ) as? [NSURL],
         !objects.isEmpty
     {
-        try exportFileClipboard(
-            objects.map { $0 as URL },
-            changeCount: changeCount,
-            to: path
-        )
+        do {
+            try exportFileClipboard(
+                objects.map { $0 as URL },
+                changeCount: changeCount,
+                to: path
+            )
+        } catch ClipboardError.unsupportedType {
+            try? FileManager.default.removeItem(atPath: path)
+            print("\(changeCount) EMPTY 0")
+        }
         return
     }
     if
         let filePaths = pasteboard.propertyList(forType: fileNamesType) as? [String],
         !filePaths.isEmpty
     {
-        try exportFileClipboard(
-            filePaths.map { URL(fileURLWithPath: $0) },
-            changeCount: changeCount,
-            to: path
-        )
+        do {
+            try exportFileClipboard(
+                filePaths.map { URL(fileURLWithPath: $0) },
+                changeCount: changeCount,
+                to: path
+            )
+        } catch ClipboardError.unsupportedType {
+            try? FileManager.default.removeItem(atPath: path)
+            print("\(changeCount) EMPTY 0")
+        }
         return
     }
 
