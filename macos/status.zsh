@@ -15,7 +15,7 @@ if [[ -f "$config" ]]; then
   health_command="powershell -NoProfile -ExecutionPolicy Bypass -File \"$WINDOWS_REMOTE_SCRIPT\" health"
   health="$(ssh -T -o BatchMode=yes -o ConnectTimeout=5 -o ClearAllForwardings=yes "$SSH_TARGET" "$health_command" 2>/dev/null)"
   health="${health%$'\r'}"
-  if [[ "$health" =~ '^OK V5 [1-9][0-9]*$' ]]; then
+  if [[ "$health" =~ '^OK V7 [1-9][0-9]*$' ]]; then
     print -- "windows_reachable=yes"
   else
     print -- "windows_reachable=no"
@@ -23,3 +23,12 @@ if [[ -f "$config" ]]; then
 else
   print -- "ssh_target_configured=no"
 fi
+
+runtime_dir="$HOME/Library/Caches/mac-windows-ssh-clipboard"
+setopt null_glob
+owners=("$runtime_dir"/transfers/*.owner.pid)
+fetches=("$runtime_dir"/transfers/*.fetching)
+caches=("$runtime_dir"/received/*(/))
+print -- "pending_windows_file_offers=${#owners}"
+print -- "pending_windows_file_fetches=${#fetches}"
+print -- "cached_windows_transfers=${#caches}"

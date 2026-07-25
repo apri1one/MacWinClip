@@ -2,6 +2,7 @@ import AppKit
 import CryptoKit
 import Darwin
 import Foundation
+import UniformTypeIdentifiers
 
 enum ClipboardError: Error {
     case invalidArguments
@@ -14,6 +15,7 @@ enum ClipboardError: Error {
 struct FileEntry: Codable {
     var index: Int
     var name: String
+    var kind: String
     var size: Int64
     var sha256: String
     var sourcePath: String?
@@ -34,7 +36,7 @@ func readManifest(_ path: String) throws -> FileManifest {
     let data = try Data(contentsOf: URL(fileURLWithPath: path))
     let manifest = try JSONDecoder().decode(FileManifest.self, from: data)
     guard
-        manifest.version == 1,
+        manifest.version == 2,
         !manifest.files.isEmpty,
         manifest.files.count <= 1000,
         manifest.id.isEmpty || manifest.id.range(
@@ -46,26 +48,54 @@ func readManifest(_ path: String) throws -> FileManifest {
     }
 
     var total: Int64 = 0
-    var used = Set<String>()
+    var entryKinds: [String: String] = [:]
     for (expectedIndex, entry) in manifest.files.enumerated() {
-        let addition = total.addingReportingOverflow(entry.size)
         guard
             entry.index == expectedIndex,
-            entry.size >= 0,
-            !addition.overflow,
-            addition.partialValue <= 10 * 1024 * 1024 * 1024,
-            safeFileName(entry.name, used: &used) == entry.name,
-            entry.sha256.isEmpty || entry.sha256.range(
-                of: "^[a-f0-9]{64}$",
-                options: .regularExpression
-            ) != nil,
-            entry.sourcePath == nil || entry.sourcePath?.hasPrefix("/") == true
+            entry.kind == "file" || entry.kind == "directory",
+            isSafeRelativePath(entry.name)
         else {
             throw ClipboardError.invalidManifest
         }
-        total = addition.partialValue
+        let key = entry.name.lowercased()
+        guard entryKinds[key] == nil else {
+            throw ClipboardError.invalidManifest
+        }
+        let components = entry.name.split(separator: "/").map(String.init)
+        if components.count > 1 {
+            let parent = components.dropLast().joined(separator: "/").lowercased()
+            guard entryKinds[parent] == "directory" else {
+                throw ClipboardError.invalidManifest
+            }
+        }
+
+        if entry.kind == "directory" {
+            guard
+                entry.size == 0,
+                entry.sha256.isEmpty,
+                entry.sourcePath == nil
+            else {
+                throw ClipboardError.invalidManifest
+            }
+        } else {
+            let addition = total.addingReportingOverflow(entry.size)
+            guard
+                entry.size >= 0,
+                !addition.overflow,
+                addition.partialValue <= 10 * 1024 * 1024 * 1024,
+                entry.sha256.isEmpty || entry.sha256.range(
+                    of: "^[a-f0-9]{64}$",
+                    options: .regularExpression
+                ) != nil,
+                entry.sourcePath == nil || entry.sourcePath?.hasPrefix("/") == true
+            else {
+                throw ClipboardError.invalidManifest
+            }
+            total = addition.partialValue
+        }
+        entryKinds[key] = entry.kind
     }
-    guard total > 0, total == manifest.totalBytes else {
+    guard total == manifest.totalBytes else {
         throw ClipboardError.invalidManifest
     }
     return manifest
@@ -93,12 +123,13 @@ func safeFileName(_ original: String, used: inout Set<String>) -> String {
         candidate = "file"
     }
 
-    let stemUpper = (candidate as NSString)
-        .deletingPathExtension
-        .uppercased()
-    let reserved = ["CON", "PRN", "AUX", "NUL"] +
-        (1...9).flatMap { ["COM\($0)", "LPT\($0)"] }
-    if reserved.contains(stemUpper) {
+    let reservedPattern =
+        "^(CON|PRN|AUX|NUL|COM[1-9\\u00B9\\u00B2\\u00B3]|" +
+        "LPT[1-9\\u00B9\\u00B2\\u00B3])(?:\\.|$)"
+    if candidate.range(
+        of: reservedPattern,
+        options: [.regularExpression, .caseInsensitive]
+    ) != nil {
         candidate = "_\(candidate)"
     }
 
@@ -114,6 +145,54 @@ func safeFileName(_ original: String, used: inout Set<String>) -> String {
     }
     used.insert(unique.lowercased())
     return unique
+}
+
+func isSafeRelativePath(_ path: String) -> Bool {
+    guard
+        !path.isEmpty,
+        !path.hasPrefix("/"),
+        !path.contains("\\"),
+        path.utf16.count <= 259
+    else {
+        return false
+    }
+    let components = path.split(
+        separator: "/",
+        omittingEmptySubsequences: false
+    ).map(String.init)
+    guard !components.isEmpty else {
+        return false
+    }
+    for component in components {
+        if component == "." || component == ".." {
+            return false
+        }
+        if component.lengthOfBytes(using: .utf8) > 255 {
+            return false
+        }
+        var used = Set<String>()
+        if safeFileName(component, used: &used) != component {
+            return false
+        }
+    }
+    return true
+}
+
+func fileTypeAndSize(_ path: String) throws -> (String, Int64) {
+    var information = Darwin.stat()
+    guard Darwin.lstat(path, &information) == 0 else {
+        throw ClipboardError.invalidManifest
+    }
+    switch information.st_mode & S_IFMT {
+    case S_IFREG:
+        return ("file", Int64(information.st_size))
+    case S_IFDIR:
+        return ("directory", 0)
+    case S_IFLNK:
+        throw ClipboardError.unsupportedType
+    default:
+        throw ClipboardError.unsupportedType
+    }
 }
 
 func sha256(of path: String) throws -> String {
@@ -228,44 +307,92 @@ func copyAndHash(source: String, destination: String, cancelPath: String) throws
     return (hash, total)
 }
 
-func exportFileClipboard(_ urls: [URL], changeCount: Int, to path: String) throws {
-    var entries: [FileEntry] = []
-    var total: Int64 = 0
-    var used = Set<String>()
-
-    for (index, url) in urls.enumerated() {
-        let values = try url.resourceValues(
-            forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
-        )
-        guard values.isRegularFile == true, values.isSymbolicLink != true else {
-            throw ClipboardError.unsupportedType
-        }
-        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-        guard let number = attributes[.size] as? NSNumber else {
-            throw ClipboardError.invalidManifest
-        }
-        let size = number.int64Value
+func appendClipboardEntry(
+    url: URL,
+    relativePath: String,
+    entries: inout [FileEntry],
+    total: inout Int64
+) throws {
+    guard entries.count < 1000, isSafeRelativePath(relativePath) else {
+        throw ClipboardError.invalidManifest
+    }
+    let (kind, size) = try fileTypeAndSize(url.path)
+    if kind == "file" {
         let addition = total.addingReportingOverflow(size)
-        guard !addition.overflow else {
+        guard
+            size >= 0,
+            !addition.overflow,
+            addition.partialValue <= 10 * 1024 * 1024 * 1024
+        else {
             throw ClipboardError.invalidManifest
         }
-        total = addition.partialValue
         entries.append(
             FileEntry(
-                index: index,
-                name: safeFileName(url.lastPathComponent, used: &used),
+                index: entries.count,
+                name: relativePath,
+                kind: "file",
                 size: size,
                 sha256: "",
                 sourcePath: url.path
             )
         )
+        total = addition.partialValue
+        return
     }
 
-    guard total > 0 else {
+    entries.append(
+        FileEntry(
+            index: entries.count,
+            name: relativePath,
+            kind: "directory",
+            size: 0,
+            sha256: "",
+            sourcePath: nil
+        )
+    )
+    let children = try FileManager.default.contentsOfDirectory(
+        at: url,
+        includingPropertiesForKeys: nil,
+        options: []
+    ).sorted {
+        $0.lastPathComponent.compare(
+            $1.lastPathComponent,
+            options: [.literal],
+            locale: Locale(identifier: "en_US_POSIX")
+        ) == .orderedAscending
+    }
+    var used = Set<String>()
+    for child in children {
+        let safeName = safeFileName(child.lastPathComponent, used: &used)
+        try appendClipboardEntry(
+            url: child,
+            relativePath: "\(relativePath)/\(safeName)",
+            entries: &entries,
+            total: &total
+        )
+    }
+}
+
+func exportFileClipboard(_ urls: [URL], changeCount: Int, to path: String) throws {
+    var entries: [FileEntry] = []
+    var total: Int64 = 0
+    var used = Set<String>()
+
+    for url in urls {
+        let safeName = safeFileName(url.lastPathComponent, used: &used)
+        try appendClipboardEntry(
+            url: url,
+            relativePath: safeName,
+            entries: &entries,
+            total: &total
+        )
+    }
+
+    guard !entries.isEmpty else {
         throw ClipboardError.unsupportedType
     }
     let manifest = FileManifest(
-        version: 1,
+        version: 2,
         id: "",
         totalBytes: total,
         files: entries
@@ -379,13 +506,441 @@ func importClipboard(type: String, from path: String) throws {
     print(pasteboard.changeCount)
 }
 
+final class RemoteFilePromiseOwner: NSObject,
+    NSFilePromiseProviderDelegate,
+    NSPasteboardItemDataProvider
+{
+    private let manifest: FileManifest
+    private let cacheDirectory: String
+    private let demandPath: String
+    private let readyPath: String
+    private let failedPath: String
+    private let pasteboard: NSPasteboard
+    private let requestLock = NSLock()
+    private var requested = false
+    private var publishedChangeCount: Int?
+    private let promiseQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "MacWinClip.file-promises"
+        queue.maxConcurrentOperationCount = 1
+        queue.qualityOfService = .userInitiated
+        return queue
+    }()
+    var providers: [NSFilePromiseProvider] = []
+
+    private static let indexType = NSPasteboard.PasteboardType(
+        "com.macwinclip.remote-file-index"
+    )
+
+    init(
+        manifest: FileManifest,
+        cacheDirectory: String,
+        demandPath: String,
+        readyPath: String,
+        failedPath: String,
+        pasteboard: NSPasteboard = .general
+    ) {
+        self.manifest = manifest
+        self.cacheDirectory = cacheDirectory
+        self.demandPath = demandPath
+        self.readyPath = readyPath
+        self.failedPath = failedPath
+        self.pasteboard = pasteboard
+    }
+
+    private func topLevelEntry(at index: Int) throws -> FileEntry {
+        let topLevel = manifest.files.filter { !$0.name.contains("/") }
+        guard index >= 0 && index < topLevel.count else {
+            throw ClipboardError.invalidManifest
+        }
+        return topLevel[index]
+    }
+
+    private func ensureReady() throws {
+        requestLock.lock()
+        if !requested {
+            try? FileManager.default.removeItem(atPath: failedPath)
+            do {
+                try writePayload(Data("fetch".utf8), to: demandPath)
+                requested = true
+            } catch {
+                requestLock.unlock()
+                throw error
+            }
+        }
+        requestLock.unlock()
+
+        let deadline = Date(timeIntervalSinceNow: 30 * 60)
+        while Date() < deadline {
+            requestLock.lock()
+            let expected = publishedChangeCount
+            requestLock.unlock()
+            if let expected,
+               pasteboard.changeCount != expected {
+                throw NSError(
+                    domain: "MacWinClip",
+                    code: 5,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "The file offer was replaced on the clipboard."
+                    ]
+                )
+            }
+            if FileManager.default.fileExists(atPath: readyPath) {
+                return
+            }
+            if FileManager.default.fileExists(atPath: failedPath) {
+                throw NSError(
+                    domain: "MacWinClip",
+                    code: 2,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "The Windows file transfer failed."
+                    ]
+                )
+            }
+            if Thread.isMainThread {
+                _ = RunLoop.current.run(
+                    mode: .default,
+                    before: Date(timeIntervalSinceNow: 0.05)
+                )
+            } else {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+        }
+        throw NSError(
+            domain: "MacWinClip",
+            code: 3,
+            userInfo: [
+                NSLocalizedDescriptionKey:
+                    "Timed out waiting for the Windows file transfer."
+            ]
+        )
+    }
+
+    private func cachedURL(for entry: FileEntry) throws -> URL {
+        let root = URL(fileURLWithPath: cacheDirectory, isDirectory: true)
+        let url = root.appendingPathComponent(
+            entry.name,
+            isDirectory: entry.kind == "directory"
+        )
+        var isDirectory: ObjCBool = false
+        guard
+            FileManager.default.fileExists(
+                atPath: url.path,
+                isDirectory: &isDirectory
+            ),
+            isDirectory.boolValue == (entry.kind == "directory")
+        else {
+            throw NSError(
+                domain: "MacWinClip",
+                code: 4,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "A received file is missing from the private cache."
+                ]
+            )
+        }
+        return url
+    }
+
+    func filePromiseProvider(
+        _ filePromiseProvider: NSFilePromiseProvider,
+        fileNameForType fileType: String
+    ) -> String {
+        guard
+            let index = filePromiseProvider.userInfo as? Int,
+            let entry = try? topLevelEntry(at: index)
+        else {
+            return "MacWinClip"
+        }
+        return (entry.name as NSString).lastPathComponent
+    }
+
+    func filePromiseProvider(
+        _ filePromiseProvider: NSFilePromiseProvider,
+        writePromiseTo url: URL,
+        completionHandler: @escaping (Error?) -> Void
+    ) {
+        do {
+            guard let index = filePromiseProvider.userInfo as? Int else {
+                throw ClipboardError.invalidManifest
+            }
+            let entry = try topLevelEntry(at: index)
+            try ensureReady()
+            let source = try cachedURL(for: entry)
+            try FileManager.default.copyItem(at: source, to: url)
+            completionHandler(nil)
+        } catch {
+            completionHandler(error)
+        }
+    }
+
+    func operationQueue(
+        for filePromiseProvider: NSFilePromiseProvider
+    ) -> OperationQueue {
+        promiseQueue
+    }
+
+    func pasteboard(
+        _ pasteboard: NSPasteboard?,
+        item: NSPasteboardItem,
+        provideDataForType type: NSPasteboard.PasteboardType
+    ) {
+        guard
+            type == .fileURL,
+            let value = item.string(forType: Self.indexType),
+            let index = Int(value),
+            let entry = try? topLevelEntry(at: index)
+        else {
+            return
+        }
+        do {
+            try ensureReady()
+            let source = try cachedURL(for: entry)
+            item.setString(source.absoluteString, forType: .fileURL)
+        } catch {
+            item.setData(Data(), forType: .fileURL)
+        }
+    }
+
+    func pasteboardFinishedWithDataProvider(_ pasteboard: NSPasteboard) {
+    }
+
+    func publish() throws -> Int {
+        let topLevel = manifest.files.filter { !$0.name.contains("/") }
+        guard !topLevel.isEmpty else {
+            throw ClipboardError.invalidManifest
+        }
+
+        let transient = NSPasteboard.PasteboardType(
+            "org.nspasteboard.TransientType"
+        )
+        let concealed = NSPasteboard.PasteboardType(
+            "org.nspasteboard.ConcealedType"
+        )
+        let autoGenerated = NSPasteboard.PasteboardType(
+            "org.nspasteboard.AutoGeneratedType"
+        )
+        let sourceType = NSPasteboard.PasteboardType(
+            "org.nspasteboard.source"
+        )
+        let sourceData = Data("com.macwinclip.bridge".utf8)
+        var writings: [NSPasteboardWriting] = []
+        var promiseWritings: [NSPasteboardWriting] = []
+
+        for (index, entry) in topLevel.enumerated() {
+            let item = NSPasteboardItem()
+            item.setString(String(index), forType: Self.indexType)
+            item.setDataProvider(self, forTypes: [.fileURL])
+            item.setData(Data(), forType: transient)
+            item.setData(Data(), forType: concealed)
+            item.setData(Data(), forType: autoGenerated)
+            item.setData(sourceData, forType: sourceType)
+            writings.append(item)
+
+            let fileType: String
+            if entry.kind == "directory" {
+                fileType = UTType.folder.identifier
+            } else {
+                let extensionName = (entry.name as NSString).pathExtension
+                fileType = UTType(filenameExtension: extensionName)?
+                    .identifier ?? UTType.data.identifier
+            }
+            let provider = NSFilePromiseProvider(
+                fileType: fileType,
+                delegate: self
+            )
+            provider.userInfo = index
+            providers.append(provider)
+            promiseWritings.append(provider)
+        }
+        writings.append(contentsOf: promiseWritings)
+
+        pasteboard.prepareForNewContents(with: .currentHostOnly)
+        guard pasteboard.writeObjects(writings) else {
+            throw ClipboardError.unsupportedType
+        }
+        let changeCount = pasteboard.changeCount
+        requestLock.lock()
+        publishedChangeCount = changeCount
+        requestLock.unlock()
+        return changeCount
+    }
+}
+
+func ownPromisedFiles(
+    manifestPath: String,
+    cacheDirectory: String,
+    demandPath: String,
+    readyPath: String,
+    failedPath: String,
+    dismissedPath: String,
+    pidPath: String
+) throws {
+    guard
+        cacheDirectory.hasPrefix("/"),
+        demandPath.hasPrefix("/"),
+        readyPath.hasPrefix("/"),
+        failedPath.hasPrefix("/"),
+        dismissedPath.hasPrefix("/"),
+        pidPath.hasPrefix("/")
+    else {
+        throw ClipboardError.invalidArguments
+    }
+    defer {
+        try? FileManager.default.removeItem(atPath: pidPath)
+    }
+    let manifest = try readManifest(manifestPath)
+    guard manifest.files.allSatisfy({ $0.sha256.isEmpty }) else {
+        throw ClipboardError.invalidManifest
+    }
+    let owner = RemoteFilePromiseOwner(
+        manifest: manifest,
+        cacheDirectory: cacheDirectory,
+        demandPath: demandPath,
+        readyPath: readyPath,
+        failedPath: failedPath
+    )
+    let changeCount = try owner.publish()
+    print(changeCount)
+    fflush(stdout)
+    while NSPasteboard.general.changeCount == changeCount {
+        _ = RunLoop.current.run(
+            mode: .default,
+            before: Date(timeIntervalSinceNow: 0.1)
+        )
+    }
+    try? writePayload(Data("dismiss".utf8), to: dismissedPath)
+}
+
+func validatePromiseLayout(
+    manifestPath: String,
+    cacheDirectory: String,
+    workDirectory: String
+) throws {
+    let fileManager = FileManager.default
+    let manifest = try readManifest(manifestPath)
+    let topLevel = manifest.files.filter { !$0.name.contains("/") }
+    guard
+        !topLevel.isEmpty,
+        manifest.files.allSatisfy({ $0.sha256.isEmpty })
+    else {
+        throw ClipboardError.invalidManifest
+    }
+    try fileManager.createDirectory(
+        atPath: workDirectory,
+        withIntermediateDirectories: false,
+        attributes: [.posixPermissions: 0o700]
+    )
+    let demandPath = "\(workDirectory)/demand"
+    let readyPath = "\(workDirectory)/ready"
+    let failedPath = "\(workDirectory)/failed"
+    let destination = "\(workDirectory)/destination"
+    try fileManager.createDirectory(
+        atPath: destination,
+        withIntermediateDirectories: false,
+        attributes: [.posixPermissions: 0o700]
+    )
+    try writePayload(Data("ready".utf8), to: readyPath)
+
+    let urlPasteboard = NSPasteboard.withUniqueName()
+    let urlOwner = RemoteFilePromiseOwner(
+        manifest: manifest,
+        cacheDirectory: cacheDirectory,
+        demandPath: demandPath,
+        readyPath: readyPath,
+        failedPath: failedPath,
+        pasteboard: urlPasteboard
+    )
+    let urlChangeCount = try urlOwner.publish()
+    let leadingFileURLItems = Array(
+        (urlPasteboard.pasteboardItems ?? []).prefix(topLevel.count)
+    ).filter { $0.types.contains(.fileURL) }.count
+    guard leadingFileURLItems == topLevel.count else {
+        throw ClipboardError.unsupportedType
+    }
+    let urls = urlPasteboard.readObjects(
+        forClasses: [NSURL.self],
+        options: [.urlReadingFileURLsOnly: true]
+    ) as? [URL] ?? []
+    guard urls.count == topLevel.count else {
+        throw ClipboardError.unsupportedType
+    }
+    let urlChangeStable = urlPasteboard.changeCount == urlChangeCount
+    fputs(
+        "promise-test fileURLs=\(urls.count) " +
+        "changeStable=\(urlChangeStable)\n",
+        stderr
+    )
+
+    let directPasteboard = NSPasteboard.withUniqueName()
+    let directOwner = RemoteFilePromiseOwner(
+        manifest: manifest,
+        cacheDirectory: cacheDirectory,
+        demandPath: "\(workDirectory)/direct-demand",
+        readyPath: readyPath,
+        failedPath: failedPath,
+        pasteboard: directPasteboard
+    )
+    _ = try directOwner.publish()
+    var promiseSuccesses = 0
+    for (index, provider) in directOwner.providers.enumerated() {
+        let entry = topLevel[index]
+        let target = URL(
+            fileURLWithPath: destination,
+            isDirectory: true
+        ).appendingPathComponent(
+            entry.name,
+            isDirectory: entry.kind == "directory"
+        )
+        var completionError: Error?
+        directOwner.filePromiseProvider(
+            provider,
+            writePromiseTo: target
+        ) { error in
+            completionError = error
+        }
+        guard completionError == nil else {
+            throw completionError!
+        }
+        let (kind, size) = try fileTypeAndSize(target.path)
+        guard
+            kind == entry.kind,
+            entry.kind == "directory" || size == entry.size
+        else {
+            throw ClipboardError.invalidManifest
+        }
+        promiseSuccesses += 1
+    }
+
+    print(
+        "topLevel=\(topLevel.count) " +
+        "fileURLs=\(urls.count) promises=\(promiseSuccesses) " +
+        "leadingFileURLs=\(leadingFileURLItems) " +
+        "urlChangeStable=\(urlChangeStable)"
+    )
+}
+
 func setFileClipboard(manifestPath: String, directory: String) throws -> Int {
     let manifest = try readManifest(manifestPath)
-    let urls = manifest.files.map {
-        URL(fileURLWithPath: directory, isDirectory: true)
-            .appendingPathComponent($0.name, isDirectory: false)
+    let topLevel = manifest.files.filter { !$0.name.contains("/") }
+    let urls = try topLevel.map { entry -> URL in
+        let url = URL(fileURLWithPath: directory, isDirectory: true)
+            .appendingPathComponent(
+                entry.name,
+                isDirectory: entry.kind == "directory"
+            )
+        let (kind, size) = try fileTypeAndSize(url.path)
+        guard
+            kind == entry.kind,
+            entry.kind == "directory" || size == entry.size
+        else {
+            throw ClipboardError.invalidManifest
+        }
+        return url
     }
-    guard !urls.isEmpty, urls.allSatisfy({ FileManager.default.fileExists(atPath: $0.path) }) else {
+    guard !urls.isEmpty else {
         throw ClipboardError.invalidManifest
     }
     let pasteboard = NSPasteboard.general
@@ -398,6 +953,14 @@ func setFileClipboard(manifestPath: String, directory: String) throws -> Int {
 
 func importFiles(manifestPath: String, directory: String) throws {
     print(try setFileClipboard(manifestPath: manifestPath, directory: directory))
+}
+
+func clearClipboardIfCount(_ expected: Int) {
+    let pasteboard = NSPasteboard.general
+    if pasteboard.changeCount == expected {
+        pasteboard.clearContents()
+    }
+    print(pasteboard.changeCount)
 }
 
 func ownFiles(manifestPath: String, directory: String, pidPath: String) throws {
@@ -437,22 +1000,29 @@ func buildPublicManifest(privatePath: String, publicPath: String) throws {
     }
     var publicEntries: [FileEntry] = []
     for entry in privateManifest.files {
-        guard let sourcePath = entry.sourcePath else {
-            throw ClipboardError.invalidManifest
+        let hash: String
+        if entry.kind == "directory" {
+            hash = ""
+        } else {
+            guard let sourcePath = entry.sourcePath else {
+                throw ClipboardError.invalidManifest
+            }
+            hash = try sha256(of: sourcePath)
         }
         publicEntries.append(
             FileEntry(
                 index: entry.index,
                 name: entry.name,
+                kind: entry.kind,
                 size: entry.size,
-                sha256: try sha256(of: sourcePath),
+                sha256: hash,
                 sourcePath: nil
             )
         )
     }
     try writeManifest(
         FileManifest(
-            version: 1,
+            version: 2,
             id: privateManifest.id,
             totalBytes: privateManifest.totalBytes,
             files: publicEntries
@@ -473,6 +1043,7 @@ func buildOfferManifest(privatePath: String, offerPath: String) throws {
         FileEntry(
             index: $0.index,
             name: $0.name,
+            kind: $0.kind,
             size: $0.size,
             sha256: "",
             sourcePath: nil
@@ -480,7 +1051,7 @@ func buildOfferManifest(privatePath: String, offerPath: String) throws {
     }
     try writeManifest(
         FileManifest(
-            version: 1,
+            version: 2,
             id: privateManifest.id,
             totalBytes: privateManifest.totalBytes,
             files: offerEntries
@@ -511,6 +1082,19 @@ func stageManifest(
     do {
         var publicEntries: [FileEntry] = []
         for entry in privateManifest.files {
+            if entry.kind == "directory" {
+                publicEntries.append(
+                    FileEntry(
+                        index: entry.index,
+                        name: entry.name,
+                        kind: "directory",
+                        size: 0,
+                        sha256: "",
+                        sourcePath: nil
+                    )
+                )
+                continue
+            }
             guard let sourcePath = entry.sourcePath else {
                 throw ClipboardError.invalidManifest
             }
@@ -533,6 +1117,7 @@ func stageManifest(
                 FileEntry(
                     index: entry.index,
                     name: entry.name,
+                    kind: "file",
                     size: entry.size,
                     sha256: hash,
                     sourcePath: nil
@@ -541,7 +1126,7 @@ func stageManifest(
         }
         try writeManifest(
             FileManifest(
-                version: 1,
+                version: 2,
                 id: privateManifest.id,
                 totalBytes: privateManifest.totalBytes,
                 files: publicEntries
@@ -562,7 +1147,9 @@ func printPlan(_ path: String) throws {
             Data($0.utf8).base64EncodedString()
         } ?? "-"
         let hash = entry.sha256.isEmpty ? "-" : entry.sha256
-        print("\(entry.index)\t\(name)\t\(entry.size)\t\(hash)\t\(source)")
+        print(
+            "\(entry.index)\t\(entry.kind)\t\(name)\t\(entry.size)\t\(hash)\t\(source)"
+        )
     }
 }
 
@@ -599,9 +1186,28 @@ do {
         guard arguments.count == 2 else { throw ClipboardError.invalidArguments }
         print(NSPasteboard.general.changeCount)
 
+    case "clear-if-count":
+        guard
+            arguments.count == 3,
+            let expected = Int(arguments[2])
+        else {
+            throw ClipboardError.invalidArguments
+        }
+        clearClipboardIfCount(expected)
+
     case "export":
         guard arguments.count == 3 else { throw ClipboardError.invalidArguments }
         try exportClipboard(to: arguments[2])
+
+    case "file-manifest":
+        guard arguments.count >= 4 else { throw ClipboardError.invalidArguments }
+        try exportFileClipboard(
+            Array(arguments.dropFirst(3)).map {
+                URL(fileURLWithPath: $0)
+            },
+            changeCount: 0,
+            to: arguments[2]
+        )
 
     case "import":
         guard arguments.count == 4 else { throw ClipboardError.invalidArguments }
@@ -617,6 +1223,26 @@ do {
             manifestPath: arguments[2],
             directory: arguments[3],
             pidPath: arguments[4]
+        )
+
+    case "own-promised-files":
+        guard arguments.count == 9 else { throw ClipboardError.invalidArguments }
+        try ownPromisedFiles(
+            manifestPath: arguments[2],
+            cacheDirectory: arguments[3],
+            demandPath: arguments[4],
+            readyPath: arguments[5],
+            failedPath: arguments[6],
+            dismissedPath: arguments[7],
+            pidPath: arguments[8]
+        )
+
+    case "validate-promise-layout":
+        guard arguments.count == 5 else { throw ClipboardError.invalidArguments }
+        try validatePromiseLayout(
+            manifestPath: arguments[2],
+            cacheDirectory: arguments[3],
+            workDirectory: arguments[4]
         )
 
     case "set-id":

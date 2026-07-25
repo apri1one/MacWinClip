@@ -65,6 +65,25 @@ try {
     $shortcut = $shell.CreateShortcut($shortcutPath)
     Assert-True ($shortcut.Arguments -like "*$installRoot\start.ps1*") 'Startup shortcut targets the wrong install.'
 
+    $staleFilesId = [Guid]::NewGuid().ToString('N')
+    New-Item -ItemType Directory -Force -Path (Join-Path $installRoot 'file-requests') | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $installRoot 'outgoing') | Out-Null
+    [IO.File]::WriteAllText(
+        (Join-Path $installRoot "outbound.$staleFilesId.files.msg"),
+        '{"version":1}',
+        [Text.UTF8Encoding]::new($false)
+    )
+    [IO.File]::WriteAllText(
+        (Join-Path $installRoot "file-requests\$staleFilesId.json"),
+        '{"version":1}',
+        [Text.UTF8Encoding]::new($false)
+    )
+    [IO.File]::WriteAllText(
+        (Join-Path $installRoot "inbox\$staleFilesId.files-offer.msg"),
+        '{"version":1}',
+        [Text.UTF8Encoding]::new($false)
+    )
+
     & (Join-Path $projectRoot 'windows\install.ps1') `
         -InstallRoot $installRoot `
         -StartupDirectory $startupRoot `
@@ -72,6 +91,15 @@ try {
         -NoStart `
         -NoAutoStart
     Assert-True (-not (Test-Path -LiteralPath $shortcutPath)) 'NoAutoStart left the startup shortcut installed.'
+    Assert-True (
+        -not (Test-Path -LiteralPath (Join-Path $installRoot "outbound.$staleFilesId.files.msg"))
+    ) 'Upgrade left a stale v1 outbound file manifest.'
+    Assert-True (
+        -not (Test-Path -LiteralPath (Join-Path $installRoot "file-requests\$staleFilesId.json"))
+    ) 'Upgrade left a stale v1 file request.'
+    Assert-True (
+        -not (Test-Path -LiteralPath (Join-Path $installRoot "inbox\$staleFilesId.files-offer.msg"))
+    ) 'Upgrade left a stale v1 file offer.'
 
     $acl = [IO.Directory]::GetAccessControl($installRoot)
     Assert-True $acl.AreAccessRulesProtected 'Install directory still inherits ACL entries.'
@@ -192,18 +220,43 @@ try {
     $unicodeFileName = [Text.RegularExpressions.Regex]::Unescape(
         '\u5496\u5561\u5e97\u8bc4\u5206\u8868.csv'
     )
-    $controlledFile = Join-Path $testRoot $unicodeFileName
+    $controlledRoot = Join-Path $testRoot 'controlled.focusee'
+    $controlledEmpty = Join-Path $controlledRoot 'empty'
+    New-Item -ItemType Directory -Path $controlledEmpty | Out-Null
+    $controlledFile = Join-Path $controlledRoot $unicodeFileName
     $controlledBytes = [byte[]](0..255)
     [IO.File]::WriteAllBytes($controlledFile, $controlledBytes)
     $request = [ordered]@{
         id = $windowsFilesId
-        sources = @($controlledFile)
+        sources = @($controlledRoot)
     }
     [IO.File]::WriteAllText(
         (Join-Path $fileRequestRoot "$windowsFilesId.json"),
         ($request | ConvertTo-Json -Compress),
         [Text.UTF8Encoding]::new($false)
     )
+    & (Join-Path $relayRoot 'file-worker.ps1') `
+        -Mode OfferOutbound `
+        -MessageId $windowsFilesId
+
+    $offerMessage = Join-Path $relayRoot "outbound.$windowsFilesId.files-offer.msg"
+    Assert-True (Test-Path -LiteralPath $offerMessage) 'Windows file offer was not queued.'
+    $offerManifestBytes = [IO.File]::ReadAllBytes($offerMessage)
+    $offerManifest = [Text.Encoding]::UTF8.GetString($offerManifestBytes) | ConvertFrom-Json
+    Assert-True ([int64]$offerManifest.totalBytes -eq $controlledBytes.Length) 'Windows file offer total is wrong.'
+    Assert-True (@($offerManifest.files | Where-Object { -not [string]::IsNullOrEmpty([string]$_.sha256) }).Count -eq 0) 'Windows file offer exposed payload hashes.'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $relayRoot "outgoing\$windowsFilesId"))) 'Windows staged file bytes before a paste request.'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $relayRoot "progress\$windowsFilesId.json"))) 'Windows opened transfer progress before a paste request.'
+
+    $expected = 'OFFER ' + $windowsFilesId + ' FILES ' +
+        [Convert]::ToBase64String($offerManifestBytes)
+    Wait-ForProtocolLine $process $expected 'Windows-to-Mac file offer frame'
+    $ack = & (Join-Path $relayRoot 'remote.ps1') ack-file-event $windowsFilesId offer
+    Assert-True ($ack -eq "ACK $windowsFilesId") 'Windows file offer acknowledgement failed.'
+
+    $fetch = & (Join-Path $relayRoot 'remote.ps1') fetch-files $windowsFilesId
+    Assert-True ($fetch -eq "FETCHING $windowsFilesId") 'Windows file fetch request was rejected.'
+    Assert-True (Test-Path -LiteralPath (Join-Path $relayRoot "outbound-file-demands\$windowsFilesId.request")) 'Windows file fetch demand was not recorded.'
     & (Join-Path $relayRoot 'file-worker.ps1') `
         -Mode PrepareOutbound `
         -MessageId $windowsFilesId
@@ -213,12 +266,16 @@ try {
     $filesManifestBytes = [IO.File]::ReadAllBytes($filesMessage)
     $filesManifest = [Text.Encoding]::UTF8.GetString($filesManifestBytes) | ConvertFrom-Json
     Assert-True ([int64]$filesManifest.totalBytes -eq $controlledBytes.Length) 'Windows file manifest total is wrong.'
-    Assert-True ([string]$filesManifest.files[0].name -eq $unicodeFileName) 'Windows Unicode file name was corrupted.'
-    $windowsPayload = Join-Path $relayRoot "outgoing\$windowsFilesId\000000.payload"
+    Assert-True ([int]$filesManifest.version -eq 2) 'Windows directory manifest version is wrong.'
+    Assert-True (@($filesManifest.files | Where-Object { $_.kind -eq 'directory' }).Count -eq 2) 'Windows empty directory was not preserved.'
+    $windowsFileEntry = @($filesManifest.files | Where-Object { $_.kind -eq 'file' })[0]
+    Assert-True ([string]$windowsFileEntry.name -eq "controlled.focusee/$unicodeFileName") 'Windows Unicode nested file name was corrupted.'
+    $windowsPayloadName = '{0:d6}.payload' -f [int]$windowsFileEntry.index
+    $windowsPayload = Join-Path (Join-Path $relayRoot "outgoing\$windowsFilesId") $windowsPayloadName
     Assert-True (Test-Path -LiteralPath $windowsPayload) 'Windows file payload was not staged.'
     Assert-True (
         (Get-FileHash -LiteralPath $windowsPayload -Algorithm SHA256).Hash.ToLowerInvariant() -eq
-        [string]$filesManifest.files[0].sha256
+        [string]$windowsFileEntry.sha256
     ) 'Windows staged file hash is wrong.'
 
     $expected = 'SET ' + $windowsFilesId + ' FILES ' +
@@ -232,27 +289,60 @@ try {
     $macFileHash = [BitConverter]::ToString(
         [Security.Cryptography.SHA256]::Create().ComputeHash($controlledBytes)
     ).Replace('-', '').ToLowerInvariant()
+    $macRootName = 'controlled.focusee'
+    $macEmptyName = "$macRootName/empty"
+    $macNestedName = "$macRootName/$unicodeFileName"
     $macManifest = [ordered]@{
-        version = 1
+        version = 2
         id = $macFilesId
         totalBytes = $controlledBytes.Length
         files = @(
             [ordered]@{
                 index = 0
-                name = $unicodeFileName
+                name = $macRootName
+                kind = 'directory'
+                size = 0
+                sha256 = ''
+            },
+            [ordered]@{
+                index = 1
+                name = $macEmptyName
+                kind = 'directory'
+                size = 0
+                sha256 = ''
+            },
+            [ordered]@{
+                index = 2
+                name = $macNestedName
+                kind = 'file'
                 size = $controlledBytes.Length
                 sha256 = $macFileHash
             }
         )
     }
     $macOffer = [ordered]@{
-        version = 1
+        version = 2
         id = $macFilesId
         totalBytes = $controlledBytes.Length
         files = @(
             [ordered]@{
                 index = 0
-                name = $unicodeFileName
+                name = $macRootName
+                kind = 'directory'
+                size = 0
+                sha256 = ''
+            },
+            [ordered]@{
+                index = 1
+                name = $macEmptyName
+                kind = 'directory'
+                size = 0
+                sha256 = ''
+            },
+            [ordered]@{
+                index = 2
+                name = $macNestedName
+                kind = 'file'
                 size = $controlledBytes.Length
                 sha256 = ''
             }
@@ -275,8 +365,9 @@ try {
     Add-Type -Path (Join-Path $projectRoot 'windows\lazy-files.cs')
     $lazyObject = [MacWinClip.LazyFileDataObject]::new(
         $macFilesId,
-        [string[]]@($unicodeFileName),
-        [int64[]]@($controlledBytes.Length),
+        [string[]]@($macRootName, $macEmptyName, $macNestedName),
+        [int64[]]@(0, 0, $controlledBytes.Length),
+        [bool[]]@($true, $true, $false),
         (Join-Path $relayRoot 'file-demands'),
         (Join-Path $receiveRoot 'MacWinClip'),
         (Join-Path $testRoot 'no-progress-ui-in-isolated-test.ps1'),
@@ -297,6 +388,87 @@ try {
         -not (Test-Path -LiteralPath (Join-Path $relayRoot "file-demands\$macFilesId.request"))
     ) 'Reading file metadata incorrectly triggered the file transfer.'
 
+    $emptyDirectoryId = [Guid]::NewGuid().ToString('N')
+    $emptyDirectoryManifest = [ordered]@{
+        version = 2
+        id = $emptyDirectoryId
+        totalBytes = 0
+        files = @(
+            [ordered]@{
+                index = 0
+                name = 'empty-only'
+                kind = 'directory'
+                size = 0
+                sha256 = ''
+            }
+        )
+    }
+    [IO.File]::WriteAllText(
+        (Join-Path $relayRoot "upload.$emptyDirectoryId.files.tmp"),
+        ($emptyDirectoryManifest | ConvertTo-Json -Depth 5 -Compress),
+        [Text.UTF8Encoding]::new($false)
+    )
+    $emptyOffered = & (Join-Path $relayRoot 'remote.ps1') offer-files $emptyDirectoryId
+    Assert-True ($emptyOffered -eq "OFFERED $emptyDirectoryId") 'All-directory offer was rejected.'
+    $emptyDirectoryObject = [MacWinClip.LazyFileDataObject]::new(
+        $emptyDirectoryId,
+        [string[]]@('empty-only'),
+        [int64[]]@(0),
+        [bool[]]@($true),
+        (Join-Path $relayRoot 'file-demands'),
+        (Join-Path $receiveRoot 'MacWinClip'),
+        (Join-Path $testRoot 'no-progress-ui-in-isolated-test.ps1'),
+        (Join-Path $relayRoot 'progress'),
+        (Join-Path $relayRoot 'cancel')
+    )
+    $emptyFormats = [Runtime.InteropServices.ComTypes.FORMATETC[]]::new(3)
+    $emptyFetched = [int[]]::new(1)
+    [void]$emptyDirectoryObject.EnumFormatEtc(
+        [Runtime.InteropServices.ComTypes.DATADIR]::DATADIR_GET
+    ).Next(3, $emptyFormats, $emptyFetched)
+    $emptyDescriptor = $emptyFormats[0]
+    $emptyMedium = [Runtime.InteropServices.ComTypes.STGMEDIUM]::new()
+    $emptyDirectoryObject.GetData([ref]$emptyDescriptor, [ref]$emptyMedium)
+    Assert-True (
+        Test-Path -LiteralPath (Join-Path $relayRoot "file-demands\$emptyDirectoryId.request")
+    ) 'An all-directory offer did not request protocol completion.'
+    [IO.File]::WriteAllText(
+        (Join-Path $relayRoot "upload.$emptyDirectoryId.files.tmp"),
+        ($emptyDirectoryManifest | ConvertTo-Json -Depth 5 -Compress),
+        [Text.UTF8Encoding]::new($false)
+    )
+    $emptyRetry = & (Join-Path $relayRoot 'remote.ps1') offer-files $emptyDirectoryId
+    Assert-True ($emptyRetry -eq "OFFERED $emptyDirectoryId") 'Idempotent offer retry failed.'
+    Assert-True (
+        Test-Path -LiteralPath (Join-Path $relayRoot "file-demands\$emptyDirectoryId.request")
+    ) 'Offer retry deleted an active paste demand.'
+    Wait-ForProtocolLine $process "FETCH $emptyDirectoryId" 'All-directory lazy demand'
+    [IO.File]::WriteAllText(
+        (Join-Path $relayRoot "upload.$emptyDirectoryId.files.tmp"),
+        ($emptyDirectoryManifest | ConvertTo-Json -Depth 5 -Compress),
+        [Text.UTF8Encoding]::new($false)
+    )
+    $emptyReady = & (Join-Path $relayRoot 'remote.ps1') begin-files $emptyDirectoryId
+    Assert-True ($emptyReady -eq "READY $emptyDirectoryId") 'All-directory receiver did not become ready.'
+    $emptyAck = & (Join-Path $relayRoot 'remote.ps1') commit-files $emptyDirectoryId
+    Assert-True ($emptyAck -eq "ACK $emptyDirectoryId") 'All-directory commit failed.'
+    Assert-True (
+        Test-Path -LiteralPath (
+            Join-Path $receiveRoot "MacWinClip\$emptyDirectoryId\empty-only"
+        ) -PathType Container
+    ) 'All-directory transfer did not create the empty directory.'
+
+    $directoryFormat = $formats[1]
+    $directoryFormat.lindex = 0
+    Assert-True (
+        $lazyObject.QueryGetData([ref]$directoryFormat) -ne 0
+    ) 'Lazy clipboard incorrectly exposed file contents for a directory.'
+    $fileQueryFormat = $formats[1]
+    $fileQueryFormat.lindex = 2
+    Assert-True (
+        $lazyObject.QueryGetData([ref]$fileQueryFormat) -eq 0
+    ) 'Lazy clipboard did not expose file contents for a nested file.'
+
     [IO.File]::WriteAllText(
         (Join-Path $relayRoot "file-demands\$macFilesId.request"),
         'fetch',
@@ -311,9 +483,9 @@ try {
     )
     $ready = & (Join-Path $relayRoot 'remote.ps1') begin-files $macFilesId
     Assert-True ($ready -eq "READY $macFilesId") 'Windows file receiver did not become ready.'
-    $incomingPart = Join-Path $relayRoot "incoming\$macFilesId\000000.part"
+    $incomingPart = Join-Path $relayRoot "incoming\$macFilesId\000002.part"
     [IO.File]::WriteAllBytes($incomingPart, $controlledBytes)
-    $partSize = & (Join-Path $relayRoot 'remote.ps1') file-size $macFilesId 0 0
+    $partSize = & (Join-Path $relayRoot 'remote.ps1') file-size $macFilesId 2 0
     Assert-True ([int64]$partSize -eq $controlledBytes.Length) 'Windows incoming file progress is wrong.'
     $ack = & (Join-Path $relayRoot 'remote.ps1') commit-files $macFilesId
     Assert-True ($ack -eq "ACK $macFilesId") 'Windows incoming file commit failed.'
@@ -322,8 +494,12 @@ try {
     Assert-True (
         Test-Path -LiteralPath (Join-Path $relayRoot "file-demands\$macFilesId.done")
     ) 'Lazy file completion marker is missing.'
-    $receivedFile = Join-Path (Join-Path $receiveRoot "MacWinClip\$macFilesId") $unicodeFileName
+    $receivedRoot = Join-Path $receiveRoot "MacWinClip\$macFilesId\$macRootName"
+    $receivedFile = Join-Path $receivedRoot $unicodeFileName
     Assert-True (Test-Path -LiteralPath $receivedFile) 'Windows received file is missing.'
+    Assert-True (
+        Test-Path -LiteralPath (Join-Path $receivedRoot 'empty') -PathType Container
+    ) 'Windows received empty directory is missing.'
     Assert-True (
         [Convert]::ToBase64String([IO.File]::ReadAllBytes($receivedFile)) -eq
         [Convert]::ToBase64String($controlledBytes)
@@ -331,9 +507,9 @@ try {
     $unicodeState = Get-Content -LiteralPath (Join-Path $relayRoot "progress\$macFilesId.json") `
         -Raw -Encoding UTF8 |
         ConvertFrom-Json
-    Assert-True ([string]$unicodeState.name -eq $unicodeFileName) 'Windows progress state corrupted a Unicode file name.'
+    Assert-True ([string]$unicodeState.name -eq $macRootName) 'Windows progress state corrupted a directory name.'
     $contentFormat = $formats[1]
-    $contentFormat.lindex = 0
+    $contentFormat.lindex = 2
     $contentMedium = [Runtime.InteropServices.ComTypes.STGMEDIUM]::new()
     $lazyObject.GetData([ref]$contentFormat, [ref]$contentMedium)
     Assert-True (
@@ -353,13 +529,14 @@ try {
 
     $unsafeFilesId = [Guid]::NewGuid().ToString('N')
     $unsafeManifest = [ordered]@{
-        version = 1
+        version = 2
         id = $unsafeFilesId
         totalBytes = 1
         files = @(
             [ordered]@{
                 index = 0
-                name = '..\escape.bin'
+                name = 'root/../escape.bin'
+                kind = 'file'
                 size = 1
                 sha256 = ('0' * 64)
             }
@@ -378,15 +555,77 @@ try {
     }
     Assert-True $unsafeRejected 'Path traversal file name was accepted.'
 
+    $missingParentId = [Guid]::NewGuid().ToString('N')
+    $missingParentManifest = [ordered]@{
+        version = 2
+        id = $missingParentId
+        totalBytes = 1
+        files = @(
+            [ordered]@{
+                index = 0
+                name = 'missing/child.bin'
+                kind = 'file'
+                size = 1
+                sha256 = ('0' * 64)
+            }
+        )
+    }
+    [IO.File]::WriteAllText(
+        (Join-Path $relayRoot "upload.$missingParentId.files.tmp"),
+        ($missingParentManifest | ConvertTo-Json -Depth 5 -Compress),
+        [Text.UTF8Encoding]::new($false)
+    )
+    $missingParentRejected = $false
+    try {
+        & (Join-Path $relayRoot 'remote.ps1') begin-files $missingParentId
+    } catch {
+        $missingParentRejected = $true
+    }
+    Assert-True $missingParentRejected 'A child without a directory entry was accepted.'
+
+    $canceledFilesId = [Guid]::NewGuid().ToString('N')
+    $cancelAck = & (Join-Path $relayRoot 'remote.ps1') cancel-files $canceledFilesId
+    Assert-True ($cancelAck -eq "ACK $canceledFilesId") 'File cancellation was not acknowledged.'
+    Assert-True (
+        Test-Path -LiteralPath (Join-Path $relayRoot "cancel\$canceledFilesId.canceled")
+    ) 'File cancellation did not leave a durable tombstone.'
+    $canceledManifest = [ordered]@{
+        version = 2
+        id = $canceledFilesId
+        totalBytes = 0
+        files = @(
+            [ordered]@{
+                index = 0
+                name = 'must-not-commit'
+                kind = 'directory'
+                size = 0
+                sha256 = ''
+            }
+        )
+    }
+    [IO.File]::WriteAllText(
+        (Join-Path $relayRoot "upload.$canceledFilesId.files.tmp"),
+        ($canceledManifest | ConvertTo-Json -Depth 5 -Compress),
+        [Text.UTF8Encoding]::new($false)
+    )
+    $canceledBeginRejected = $false
+    try {
+        & (Join-Path $relayRoot 'remote.ps1') begin-files $canceledFilesId
+    } catch {
+        $canceledBeginRejected = $true
+    }
+    Assert-True $canceledBeginRejected 'A canceled transfer was allowed to restart.'
+
     $oversizeFilesId = [Guid]::NewGuid().ToString('N')
     $oversizeManifest = [ordered]@{
-        version = 1
+        version = 2
         id = $oversizeFilesId
         totalBytes = 10737418241
         files = @(
             [ordered]@{
                 index = 0
                 name = 'oversize.bin'
+                kind = 'file'
                 size = 10737418241
                 sha256 = ('0' * 64)
             }
@@ -418,7 +657,7 @@ try {
     Assert-True (-not (Test-Path -LiteralPath $installRoot)) 'Uninstall left the application directory.'
     Assert-True (-not (Test-Path -LiteralPath $shortcutPath)) 'Uninstall left the startup shortcut.'
 
-    Write-Output 'PASS Windows isolated install, autostart, ACL, text/image/lazy-file protocol, limits, and uninstall'
+    Write-Output 'PASS Windows isolated install, autostart, ACL, text/image/lazy-directory protocol, limits, and uninstall'
 } finally {
     if ($null -ne $process) {
         if (-not $process.HasExited) {

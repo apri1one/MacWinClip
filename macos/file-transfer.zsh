@@ -40,9 +40,10 @@ worker_pid_file="$transfer_dir/$message_id.worker.pid"
 owner_pid_file="$transfer_dir/$message_id.owner.pid"
 owner_count_file="$transfer_dir/$message_id.owner.count"
 staging_root="$transfer_dir/$message_id.staging"
+file_cache_root="${FILE_CACHE_DIR:-$HOME/Library/Caches/mac-windows-ssh-clipboard/received}"
 receive_destination=""
-mkdir -p "$transfer_dir" "$completion_dir"
-chmod 700 "$runtime_dir" "$transfer_dir" "$completion_dir"
+mkdir -p "$transfer_dir" "$completion_dir" "$file_cache_root"
+chmod 700 "$runtime_dir" "$transfer_dir" "$completion_dir" "$file_cache_root"
 rm -f "$cancel_file"
 print -r -- "$$" > "$worker_pid_file"
 trap 'rm -f "$worker_pid_file"' EXIT
@@ -85,7 +86,7 @@ cancel_requested() {
 
 remove_receive_destination() {
   if [[ -n "$receive_destination" &&
-        "$receive_destination" == "$HOME/Downloads/MacWinClip/$message_id" &&
+        "$receive_destination" == "$file_cache_root/$message_id" &&
         -d "$receive_destination" ]]; then
     rm -rf "$receive_destination"
   fi
@@ -103,16 +104,18 @@ schedule_state_cleanup() {
 }
 
 load_manifest_plan() {
-  local line index name64 size hash source64
+  local line index kind name64 size hash source64
   plan_indexes=()
+  plan_kinds=()
   plan_names=()
   plan_sizes=()
   plan_hashes=()
   plan_sources=()
 
-  while IFS=$'\t' read -r index name64 size hash source64; do
+  while IFS=$'\t' read -r index kind name64 size hash source64; do
     [[ -z "$index" ]] && continue
     plan_indexes+=("$index")
+    plan_kinds+=("$kind")
     plan_names+=("$(decode_base64 "$name64")")
     plan_sizes+=("$size")
     plan_hashes+=("$hash")
@@ -128,10 +131,17 @@ load_manifest_plan() {
 }
 
 display_name_for_plan() {
-  if (( ${#plan_names} == 1 )); then
-    print -r -- "$plan_names[1]"
+  local name
+  local -a top_level
+
+  top_level=()
+  for name in "${plan_names[@]}"; do
+    [[ "$name" != */* ]] && top_level+=("$name")
+  done
+  if (( ${#top_level} == 1 )); then
+    print -r -- "$top_level[1]"
   else
-    print -r -- "${#plan_names} 个文件"
+    print -r -- "${#top_level} 个项目"
   fi
 }
 
@@ -139,6 +149,7 @@ cancel_transfer() {
   remote_action cancel-files "$message_id" >/dev/null 2>&1 || true
   remove_receive_destination
   write_progress "Canceled" 0 "$1" "$2" "传输已取消。" "$3" || true
+  [[ "$mode" == "receive" ]] && print -r -- "canceled" > "$completion_dir/$message_id.failed"
   rm -f "$manifest_path" "$public_manifest"
   rm -rf "$staging_root"
   schedule_state_cleanup
@@ -191,6 +202,7 @@ send_to_windows() {
 
   transferred=0
   for (( array_index = 1; array_index <= ${#plan_indexes}; array_index++ )); do
+    [[ "$plan_kinds[$array_index]" == "directory" ]] && continue
     index="$plan_indexes[$array_index]"
     source_path="$staging_root/$(printf '%06d' "$index").payload"
     file_size="$plan_sizes[$array_index]"
@@ -242,27 +254,39 @@ send_to_windows() {
 
 receive_from_windows() {
   local total display_name destination transferred file_size index array_index
-  local local_part final_path remote_payload scp_pid current change_count response
-  local owner_pid owner_attempt
+  local local_part final_path remote_payload scp_pid current response
   local last_remote_update now_epoch previous_epoch
 
   total="$("$CLIPBOARD_HELPER" manifest-total "$manifest_path")" || return 1
   load_manifest_plan "$manifest_path" || return 1
   display_name="$(display_name_for_plan)"
-  destination="$HOME/Downloads/MacWinClip/$message_id"
+  destination="$file_cache_root/$message_id"
   receive_destination="$destination"
+  rm -rf "$destination"
   mkdir -p "$destination"
-  chmod 700 "$HOME/Downloads/MacWinClip" "$destination" 2>/dev/null || true
+  chmod 700 "$file_cache_root" "$destination" 2>/dev/null || true
   write_progress "Transferring" 0 "$total" "$display_name" "正在从 Windows 接收…" "正在从 Windows 接收" || return 1
   start_progress_ui
+
+  for (( array_index = 1; array_index <= ${#plan_indexes}; array_index++ )); do
+    if [[ "$plan_kinds[$array_index]" == "directory" ]]; then
+      mkdir -p "$destination/$plan_names[$array_index]" || {
+        fail_transfer "$total" "$display_name" "无法创建接收目录。" "正在从 Windows 接收"
+      }
+    fi
+  done
 
   transferred=0
   previous_epoch=0
   for (( array_index = 1; array_index <= ${#plan_indexes}; array_index++ )); do
+    [[ "$plan_kinds[$array_index]" == "directory" ]] && continue
     index="$plan_indexes[$array_index]"
     file_size="$plan_sizes[$array_index]"
     local_part="$destination/.$(printf '%06d' "$index").part"
     final_path="$destination/$plan_names[$array_index]"
+    mkdir -p "${final_path:h}" || {
+      fail_transfer "$total" "$display_name" "无法创建接收文件目录。" "正在从 Windows 接收"
+    }
     remote_payload="$WINDOWS_SCP_ROOT/outgoing/$message_id/$(printf '%06d' "$index").payload"
     scp "${scp_options[@]}" "$SSH_TARGET:$remote_payload" "$local_part" &
     scp_pid=$!
@@ -301,32 +325,12 @@ receive_from_windows() {
     transferred=$(( transferred + file_size ))
   done
 
-  rm -f "$owner_count_file" "$owner_pid_file"
-  "$CLIPBOARD_HELPER" own-files \
-    "$manifest_path" "$destination" "$owner_pid_file" \
-    > "$owner_count_file" 2>/dev/null &!
-  owner_pid=$!
-  print -r -- "$owner_pid" > "$owner_pid_file"
-  for owner_attempt in {1..40}; do
-    [[ -s "$owner_count_file" ]] && break
-    if ! kill -0 "$owner_pid" 2>/dev/null; then
-      break
-    fi
-    sleep 0.05
-  done
-  change_count="$(head -n 1 "$owner_count_file" 2>/dev/null)" || change_count=""
-  rm -f "$owner_count_file"
-  if [[ "$change_count" != <-> ]]; then
-    kill "$owner_pid" 2>/dev/null || true
-    rm -f "$owner_pid_file"
-    fail_transfer "$total" "$display_name" "无法写入 Mac 文件剪贴板。" "正在从 Windows 接收"
-  fi
   remote_action progress "$message_id" "$total" Done >/dev/null 2>&1 || true
   response="$(remote_action ack "$message_id")" || true
   response="${response%$'\r'}"
   [[ "$response" == "ACK $message_id" ]] || true
-  print -r -- "$change_count" > "$completion_dir/$message_id.count"
-  write_progress "Done" "$total" "$total" "$display_name" "传输完成。" "正在从 Windows 接收" || true
+  print -r -- "ready" > "$completion_dir/$message_id.ready"
+  write_progress "Done" "$total" "$total" "$display_name" "已传到 Mac 私有缓存，Finder 正在完成粘贴。" "正在从 Windows 接收" || true
   rm -f "$manifest_path"
   schedule_state_cleanup
 }

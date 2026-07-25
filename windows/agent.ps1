@@ -3,6 +3,8 @@ $root = $PSScriptRoot
 $inboxRoot = Join-Path $root 'inbox'
 $requestRoot = Join-Path $root 'file-requests'
 $outgoingRoot = Join-Path $root 'outgoing'
+$outboundOfferRoot = Join-Path $root 'outbound-file-offers'
+$outboundDemandRoot = Join-Path $root 'outbound-file-demands'
 $incomingRoot = Join-Path $root 'incoming'
 $progressRoot = Join-Path $root 'progress'
 $cancelRoot = Join-Path $root 'cancel'
@@ -37,7 +39,7 @@ if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
     throw 'Windows clipboard agent must run in an STA PowerShell process.'
 }
 
-foreach ($directory in $inboxRoot, $requestRoot, $outgoingRoot, $incomingRoot, $progressRoot, $cancelRoot, $demandRoot, $dismissRoot) {
+foreach ($directory in $inboxRoot, $requestRoot, $outgoingRoot, $outboundOfferRoot, $outboundDemandRoot, $incomingRoot, $progressRoot, $cancelRoot, $demandRoot, $dismissRoot) {
     New-Item -ItemType Directory -Force -Path $directory | Out-Null
 }
 Remove-Item -LiteralPath $stopRequest -Force -ErrorAction SilentlyContinue
@@ -127,8 +129,8 @@ function Set-ClipboardSnapshot([string]$Type, [byte[]]$Bytes) {
         $paths = [Collections.Specialized.StringCollection]::new()
         foreach ($path in @($manifest.paths)) {
             $resolved = [IO.Path]::GetFullPath([string]$path)
-            if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
-                throw 'A received file is missing.'
+            if (-not (Test-Path -LiteralPath $resolved)) {
+                throw 'A received item is missing.'
             }
             [void]$paths.Add($resolved)
         }
@@ -147,7 +149,7 @@ function Set-LazyFileOffer([string]$MessageId, [byte[]]$Bytes) {
         throw 'Receive directory configuration is missing.'
     }
     $manifest = [Text.Encoding]::UTF8.GetString($Bytes) | ConvertFrom-Json
-    if ([int]$manifest.version -ne 1 -or [string]$manifest.id -ne $MessageId) {
+    if ([int]$manifest.version -ne 2 -or [string]$manifest.id -ne $MessageId) {
         throw 'Invalid file offer.'
     }
     $files = @($manifest.files)
@@ -156,26 +158,77 @@ function Set-LazyFileOffer([string]$MessageId, [byte[]]$Bytes) {
     }
     $names = [string[]]::new($files.Count)
     $sizes = [int64[]]::new($files.Count)
+    $directories = [bool[]]::new($files.Count)
     $total = [int64]0
+    $entryKinds = [Collections.Generic.Dictionary[string,string]]::new(
+        [StringComparer]::OrdinalIgnoreCase
+    )
     for ($index = 0; $index -lt $files.Count; $index++) {
         $file = $files[$index]
         $name = [string]$file.name
+        $kind = [string]$file.kind
         $size = [int64]$file.size
         if (
             [int]$file.index -ne $index -or
             [string]::IsNullOrWhiteSpace($name) -or
             $name.Length -gt 259 -or
-            $size -lt 0 -or
-            $size -gt ($maxFileBytes - $total)
+            $name.StartsWith('/') -or
+            $name.Contains('\') -or
+            $kind -notin 'file', 'directory' -or
+            $entryKinds.ContainsKey($name)
         ) {
             throw 'Invalid file offer.'
         }
+        $components = @($name.Split('/'))
+        if ($components.Count -eq 0 -or $components -contains '' -or $components -contains '.' -or $components -contains '..') {
+            throw 'Invalid file offer.'
+        }
+        foreach ($component in $components) {
+            if (
+                [string]::IsNullOrWhiteSpace($component) -or
+                [Text.Encoding]::UTF8.GetByteCount($component) -gt 255 -or
+                $component.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0 -or
+                $component.EndsWith('.') -or
+                $component.EndsWith(' ') -or
+                $component -match '^(?i:CON|PRN|AUX|NUL|COM[1-9\u00B9\u00B2\u00B3]|LPT[1-9\u00B9\u00B2\u00B3])(?:\.|$)'
+            ) {
+                throw 'Invalid file offer.'
+            }
+        }
+        if ($components.Count -gt 1) {
+            $parent = [string]::Join('/', $components[0..($components.Count - 2)])
+            if (-not $entryKinds.ContainsKey($parent) -or $entryKinds[$parent] -ne 'directory') {
+                throw 'Invalid file offer.'
+            }
+        }
+        if ($kind -eq 'directory') {
+            if ($size -ne 0 -or [string]$file.sha256 -ne '') {
+                throw 'Invalid file offer.'
+            }
+            $directories[$index] = $true
+        } else {
+            if (
+                $size -lt 0 -or
+                $size -gt ($maxFileBytes - $total) -or
+                [string]$file.sha256 -ne ''
+            ) {
+                throw 'Invalid file offer.'
+            }
+            $total += $size
+        }
         $names[$index] = $name
         $sizes[$index] = $size
-        $total += $size
+        $entryKinds.Add($name, $kind)
     }
-    if ($total -le 0 -or [int64]$manifest.totalBytes -ne $total) {
+    if ([int64]$manifest.totalBytes -ne $total) {
         throw 'Invalid file offer.'
+    }
+
+    if (
+        $script:lazyFileMessageId -eq $MessageId -and
+        $null -ne $script:lazyFileClipboard
+    ) {
+        return
     }
 
     foreach ($suffix in 'request', 'done', 'failed', 'canceled') {
@@ -185,10 +238,18 @@ function Set-LazyFileOffer([string]$MessageId, [byte[]]$Bytes) {
         (Get-Content -LiteralPath $receiveRootFile -Raw -Encoding UTF8).Trim()
     )
     $destinationRoot = Join-Path $receiveRoot 'MacWinClip'
+    $messageRoot = Join-Path $destinationRoot "$MessageId.partial"
+    foreach ($name in $names) {
+        $relative = $name.Replace([char]'/', [IO.Path]::DirectorySeparatorChar)
+        if ([IO.Path]::GetFullPath((Join-Path $messageRoot $relative)).Length -gt 259) {
+            throw 'A received item path is too long for Windows PowerShell 5.1.'
+        }
+    }
     $script:lazyFileClipboard = [MacWinClip.LazyFileClipboard]::Set(
         $MessageId,
         $names,
         $sizes,
+        $directories,
         $demandRoot,
         $destinationRoot,
         (Join-Path $root 'progress.ps1'),
@@ -224,11 +285,11 @@ function Write-Outbound([string]$Type, [byte[]]$Bytes) {
 
 function Start-OutboundFiles([string[]]$Paths) {
     $active = @(
-        Get-ChildItem -LiteralPath $root -Filter 'outbound.*.files.msg' -File -ErrorAction SilentlyContinue
+        Get-ChildItem -LiteralPath $root -Filter 'outbound.*.files*.msg' -File -ErrorAction SilentlyContinue
         Get-ChildItem -LiteralPath $requestRoot -Filter '*.json' -File -ErrorAction SilentlyContinue
     ).Count
     if ($active -gt 0) {
-        return
+        return ''
     }
 
     $id = [Guid]::NewGuid().ToString('N')
@@ -245,6 +306,67 @@ function Start-OutboundFiles([string[]]$Paths) {
     )
     Move-Item -LiteralPath $temporary -Destination $requestPath -Force
 
+    $quotedWorker = '"' + (Join-Path $root 'file-worker.ps1') + '"'
+    Start-Process `
+        -FilePath "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" `
+        -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $quotedWorker,
+            '-Mode', 'OfferOutbound', '-MessageId', $id `
+        -WindowStyle Hidden
+    return $id
+}
+
+function Dismiss-OutboundFiles {
+    if ([string]::IsNullOrEmpty($script:outboundFileMessageId)) {
+        return
+    }
+    $id = $script:outboundFileMessageId
+    [IO.File]::WriteAllText(
+        (Join-Path $cancelRoot "$id.request"),
+        'cancel',
+        [Text.UTF8Encoding]::new($false)
+    )
+    Remove-Item -LiteralPath `
+        (Join-Path $requestRoot "$id.json"), `
+        (Join-Path $outboundOfferRoot "$id.json"), `
+        (Join-Path $outboundDemandRoot "$id.request"), `
+        (Join-Path $outboundDemandRoot "$id.started"), `
+        (Join-Path $outgoingRoot $id) `
+        -Recurse -Force -ErrorAction SilentlyContinue
+    Get-ChildItem -LiteralPath $root -Filter "outbound.$id.files*.msg" -File -ErrorAction SilentlyContinue |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+    $temporary = Join-Path $root "outbound.$id.files-withdraw.tmp"
+    $message = Join-Path $root "outbound.$id.files-withdraw.msg"
+    [IO.File]::WriteAllText(
+        $temporary,
+        'withdraw',
+        [Text.UTF8Encoding]::new($false)
+    )
+    Move-Item -LiteralPath $temporary -Destination $message -Force
+    $script:outboundFileMessageId = ''
+}
+
+function Start-PendingOutboundFileDemand {
+    $request = Get-ChildItem -LiteralPath $outboundDemandRoot -Filter '*.request' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.BaseName -match '^[a-f0-9]{32}$' } |
+        Select-Object -First 1
+    if ($null -eq $request) {
+        return
+    }
+    $id = $request.BaseName
+    if (
+        $id -ne $script:outboundFileMessageId -or
+        -not (Test-Path -LiteralPath (Join-Path $requestRoot "$id.json") -PathType Leaf) -or
+        -not (Test-Path -LiteralPath (Join-Path $outboundOfferRoot "$id.json") -PathType Leaf)
+    ) {
+        Remove-Item -LiteralPath $request.FullName -Force -ErrorAction SilentlyContinue
+        return
+    }
+    $workerPid = Join-Path $root "file-worker.$id.pid"
+    if (Test-Path -LiteralPath $workerPid -PathType Leaf) {
+        return
+    }
+    $startedPath = Join-Path $outboundDemandRoot "$id.started"
+    Move-Item -LiteralPath $request.FullName -Destination $startedPath -Force
     $quotedWorker = '"' + (Join-Path $root 'file-worker.ps1') + '"'
     Start-Process `
         -FilePath "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" `
@@ -289,7 +411,10 @@ function Remove-ExpiredProgressState {
                 $id = [IO.Path]::GetFileNameWithoutExtension($stateFile.Name)
                 Remove-Item -LiteralPath $stateFile.FullName -Force
                 Remove-Item -LiteralPath (Join-Path $progressRoot "$id.shown") -Force -ErrorAction SilentlyContinue
-                Remove-Item -LiteralPath (Join-Path $cancelRoot "$id.request") -Force -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath `
+                    (Join-Path $cancelRoot "$id.request"), `
+                    (Join-Path $cancelRoot "$id.canceled") `
+                    -Force -ErrorAction SilentlyContinue
             }
         } catch {
         }
@@ -299,6 +424,7 @@ function Remove-ExpiredProgressState {
 $lastSequence = Get-ClipboardSequence
 $lazyFileClipboard = $null
 $lazyFileMessageId = ''
+$outboundFileMessageId = ''
 
 try {
     while (-not (Test-Path -LiteralPath $stopRequest)) {
@@ -379,23 +505,30 @@ try {
         $currentSequence = Get-ClipboardSequence
         if ($currentSequence -ne $lastSequence) {
             Dismiss-LazyFileOffer
+            Dismiss-OutboundFiles
             $snapshot = Get-ClipboardSnapshot
             if ($null -ne $snapshot) {
                 if ($snapshot.Type -eq 'FILES') {
-                    Start-OutboundFiles $snapshot.Paths
+                    $outboundId = Start-OutboundFiles $snapshot.Paths
+                    if (-not [string]::IsNullOrEmpty($outboundId)) {
+                        $outboundFileMessageId = $outboundId
+                        $lastSequence = $currentSequence
+                    }
                 } elseif ($snapshot.Type -eq 'TEXT') {
                     if ($snapshot.Bytes.Length -gt 0 -and $snapshot.Bytes.Length -le $maxTextBytes) {
                         Write-Outbound $snapshot.Type $snapshot.Bytes
                     }
+                    $lastSequence = $currentSequence
                 } elseif ($snapshot.Type -eq 'PNG') {
                     if ($snapshot.Bytes.Length -gt 0 -and $snapshot.Bytes.Length -le $maxImageBytes) {
                         Write-Outbound $snapshot.Type $snapshot.Bytes
                     }
+                    $lastSequence = $currentSequence
                 }
-                $lastSequence = $currentSequence
             }
         }
 
+        Start-PendingOutboundFileDemand
         Start-PendingProgressWindows
         Remove-ExpiredProgressState
         [Windows.Forms.Application]::DoEvents()

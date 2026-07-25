@@ -27,6 +27,20 @@ if (Test-Path -LiteralPath $existingStop) {
     & $existingStop
 }
 
+foreach ($pattern in 'outbound.*.files*.msg', 'outbound.*.files*.tmp', 'upload.*.files.tmp', 'file-worker.*.pid') {
+    Get-ChildItem -LiteralPath $root -Filter $pattern -File -ErrorAction SilentlyContinue |
+        Remove-Item -Force
+}
+$existingInbox = Join-Path $root 'inbox'
+Get-ChildItem -LiteralPath $existingInbox -Filter '*.msg' -File -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.Name -match '^[a-f0-9]{32}\.(files|files-offer|files-dismiss)\.msg$'
+    } |
+    Remove-Item -Force
+foreach ($name in 'file-requests', 'outgoing', 'outbound-file-offers', 'outbound-file-demands', 'incoming', 'file-offers', 'file-demands', 'file-dismissals', 'progress', 'cancel') {
+    Remove-Item -LiteralPath (Join-Path $root $name) -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 New-Item -ItemType Directory -Force -Path $inboxRoot | Out-Null
 
 foreach ($name in 'agent.ps1', 'file-worker.ps1', 'lazy-files.cs', 'progress.ps1', 'remote.ps1', 'start.ps1', 'stop.ps1', 'status.ps1', 'uninstall.ps1') {

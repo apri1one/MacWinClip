@@ -6,6 +6,9 @@ param(
         'receive',
         'offer-files',
         'drop-offer',
+        'ack-file-event',
+        'fetch-files',
+        'drop-outbound',
         'ack',
         'begin-files',
         'commit-files',
@@ -30,6 +33,9 @@ $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 $inboxRoot = Join-Path $root 'inbox'
 $outgoingRoot = Join-Path $root 'outgoing'
+$requestRoot = Join-Path $root 'file-requests'
+$outboundOfferRoot = Join-Path $root 'outbound-file-offers'
+$outboundDemandRoot = Join-Path $root 'outbound-file-demands'
 $incomingRoot = Join-Path $root 'incoming'
 $progressRoot = Join-Path $root 'progress'
 $cancelRoot = Join-Path $root 'cancel'
@@ -42,13 +48,35 @@ $maxImageBytes = 16777216
 $maxManifestBytes = 1048576
 $maxFileBytes = [int64]10737418240
 
-foreach ($directory in $inboxRoot, $outgoingRoot, $incomingRoot, $progressRoot, $cancelRoot, $offerRoot, $demandRoot, $dismissRoot) {
+foreach ($directory in $inboxRoot, $outgoingRoot, $requestRoot, $outboundOfferRoot, $outboundDemandRoot, $incomingRoot, $progressRoot, $cancelRoot, $offerRoot, $demandRoot, $dismissRoot) {
     New-Item -ItemType Directory -Force -Path $directory | Out-Null
 }
 
 function Assert-MessageId([string]$Value) {
     if ($Value -notmatch '^[a-f0-9]{32}$') {
         throw 'Invalid message id.'
+    }
+}
+
+function Enter-MessageMutex([string]$Id) {
+    $mutex = [Threading.Mutex]::new($false, "Local\MacWinClipFile_$Id")
+    try {
+        $acquired = $mutex.WaitOne([TimeSpan]::FromSeconds(30))
+    } catch [Threading.AbandonedMutexException] {
+        $acquired = $true
+    }
+    if (-not $acquired) {
+        $mutex.Dispose()
+        throw 'Timed out waiting for the file-transfer lock.'
+    }
+    return $mutex
+}
+
+function Exit-MessageMutex([Threading.Mutex]$Mutex) {
+    try {
+        $Mutex.ReleaseMutex()
+    } finally {
+        $Mutex.Dispose()
     }
 }
 
@@ -112,6 +140,12 @@ function Remove-Outbound([string]$Id) {
         Remove-Item -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath (Join-Path $root "outbound.$Id.msg") -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath (Join-Path $outgoingRoot $Id) -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath `
+        (Join-Path $requestRoot "$Id.json"), `
+        (Join-Path $outboundOfferRoot "$Id.json"), `
+        (Join-Path $outboundDemandRoot "$Id.request"), `
+        (Join-Path $outboundDemandRoot "$Id.started") `
+        -Force -ErrorAction SilentlyContinue
 }
 
 function Read-Manifest(
@@ -128,7 +162,7 @@ function Read-Manifest(
     }
 
     $manifest = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
-    if ([int]$manifest.version -ne 1 -or [string]$manifest.id -ne $ExpectedId) {
+    if ([int]$manifest.version -ne 2 -or [string]$manifest.id -ne $ExpectedId) {
         throw 'File manifest version or id is invalid.'
     }
 
@@ -138,12 +172,13 @@ function Read-Manifest(
     }
 
     $total = [int64]0
-    $usedNames = [Collections.Generic.HashSet[string]]::new(
+    $entryKinds = [Collections.Generic.Dictionary[string,string]]::new(
         [StringComparer]::OrdinalIgnoreCase
     )
     for ($index = 0; $index -lt $files.Count; $index++) {
         $file = $files[$index]
         $name = [string]$file.name
+        $kind = [string]$file.kind
         $size = [int64]$file.size
         $hash = [string]$file.sha256
         if ([int]$file.index -ne $index) {
@@ -152,29 +187,80 @@ function Read-Manifest(
         if (
             [string]::IsNullOrWhiteSpace($name) -or
             $name.Length -gt 259 -or
-            [IO.Path]::GetFileName($name) -ne $name -or
-            $name.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0 -or
-            $name.EndsWith('.') -or
-            $name.EndsWith(' ') -or
-            $name -match '^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)' -or
-            -not $usedNames.Add($name)
+            $name.StartsWith('/') -or
+            $name.Contains('\') -or
+            $kind -notin 'file', 'directory' -or
+            $entryKinds.ContainsKey($name)
         ) {
             throw 'File manifest name is invalid.'
         }
-        $validHash = $hash -match '^[a-f0-9]{64}$' -or ($AllowMissingHash -and $hash -eq '')
-        if ($size -lt 0 -or -not $validHash) {
-            throw 'File manifest size or hash is invalid.'
+        $components = @($name.Split('/'))
+        if ($components.Count -eq 0 -or $components -contains '' -or $components -contains '.' -or $components -contains '..') {
+            throw 'File manifest path is invalid.'
         }
-        if ($size -gt ($maxFileBytes - $total)) {
-            throw 'File manifest exceeds the 10 GiB limit.'
+        foreach ($component in $components) {
+            if (
+                [string]::IsNullOrWhiteSpace($component) -or
+                [Text.Encoding]::UTF8.GetByteCount($component) -gt 255 -or
+                $component.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0 -or
+                $component.EndsWith('.') -or
+                $component.EndsWith(' ') -or
+                $component -match '^(?i:CON|PRN|AUX|NUL|COM[1-9\u00B9\u00B2\u00B3]|LPT[1-9\u00B9\u00B2\u00B3])(?:\.|$)'
+            ) {
+                throw 'File manifest path component is invalid.'
+            }
         }
-        $total += $size
+        if ($components.Count -gt 1) {
+            $parent = [string]::Join('/', $components[0..($components.Count - 2)])
+            if (-not $entryKinds.ContainsKey($parent) -or $entryKinds[$parent] -ne 'directory') {
+                throw 'File manifest parent directory is missing.'
+            }
+        }
+
+        if ($kind -eq 'directory') {
+            if ($size -ne 0 -or $hash -ne '') {
+                throw 'Directory manifest entry is invalid.'
+            }
+        } else {
+            $validHash = $hash -match '^[a-f0-9]{64}$' -or ($AllowMissingHash -and $hash -eq '')
+            if ($size -lt 0 -or -not $validHash) {
+                throw 'File manifest size or hash is invalid.'
+            }
+            if ($size -gt ($maxFileBytes - $total)) {
+                throw 'File manifest exceeds the 10 GiB limit.'
+            }
+            $total += $size
+        }
+        $entryKinds.Add($name, $kind)
     }
 
-    if ($total -le 0 -or [int64]$manifest.totalBytes -ne $total) {
+    if ([int64]$manifest.totalBytes -ne $total) {
         throw 'File manifest total is invalid.'
     }
     return $manifest
+}
+
+function Assert-ReceivePaths($Manifest, [string]$Id) {
+    if (-not (Test-Path -LiteralPath $receiveRootFile -PathType Leaf)) {
+        throw 'Receive directory configuration is missing.'
+    }
+    $configuredRoot = [IO.Path]::GetFullPath(
+        (Get-Content -LiteralPath $receiveRootFile -Raw -Encoding UTF8).Trim()
+    )
+    $destination = Join-Path (Join-Path $configuredRoot 'MacWinClip') "$Id.partial"
+    $destinationPrefix = $destination.TrimEnd('\') + '\'
+    foreach ($file in @($Manifest.files)) {
+        $relative = ([string]$file.name).Replace(
+            [char]'/', [IO.Path]::DirectorySeparatorChar
+        )
+        $full = [IO.Path]::GetFullPath((Join-Path $destination $relative))
+        if (
+            $full.Length -gt 259 -or
+            -not $full.StartsWith($destinationPrefix, [StringComparison]::OrdinalIgnoreCase)
+        ) {
+            throw 'A received item path is unsafe or too long for Windows PowerShell 5.1.'
+        }
+    }
 }
 
 if ($Action -eq 'health') {
@@ -191,7 +277,56 @@ if ($Action -eq 'health') {
     if ($agentProcess.SessionId -eq 0) {
         exit 1
     }
-    Write-Output "OK V5 $($agentProcess.SessionId)"
+    Write-Output "OK V7 $($agentProcess.SessionId)"
+    exit 0
+}
+
+if ($Action -eq 'ack-file-event') {
+    Assert-MessageId $MessageId
+    if ($Argument -notin 'offer', 'failed', 'withdraw') {
+        throw 'Invalid file event.'
+    }
+    Remove-Item -LiteralPath (Join-Path $root "outbound.$MessageId.files-$Argument.msg") -Force -ErrorAction SilentlyContinue
+    Write-Output "ACK $MessageId"
+    exit 0
+}
+
+if ($Action -eq 'fetch-files') {
+    Assert-MessageId $MessageId
+    if (
+        -not (Test-Path -LiteralPath (Join-Path $requestRoot "$MessageId.json") -PathType Leaf) -or
+        -not (Test-Path -LiteralPath (Join-Path $outboundOfferRoot "$MessageId.json") -PathType Leaf)
+    ) {
+        throw 'The Windows file offer is no longer available.'
+    }
+    if (
+        -not (Test-Path -LiteralPath (Join-Path $root "outbound.$MessageId.files.msg") -PathType Leaf) -and
+        -not (Test-Path -LiteralPath (Join-Path $outboundDemandRoot "$MessageId.started") -PathType Leaf)
+    ) {
+        [IO.File]::WriteAllText(
+            (Join-Path $outboundDemandRoot "$MessageId.request"),
+            'fetch',
+            [Text.UTF8Encoding]::new($false)
+        )
+    }
+    Write-Output "FETCHING $MessageId"
+    exit 0
+}
+
+if ($Action -eq 'drop-outbound') {
+    Assert-MessageId $MessageId
+    [IO.File]::WriteAllText(
+        (Join-Path $cancelRoot "$MessageId.request"),
+        'cancel',
+        [Text.UTF8Encoding]::new($false)
+    )
+    Remove-Outbound $MessageId
+    Remove-Item -LiteralPath `
+        (Join-Path $root "outbound.$MessageId.files-offer.msg"), `
+        (Join-Path $root "outbound.$MessageId.files-failed.msg"), `
+        (Join-Path $root "outbound.$MessageId.files-withdraw.msg") `
+        -Force -ErrorAction SilentlyContinue
+    Write-Output "ACK $MessageId"
     exit 0
 }
 
@@ -245,11 +380,36 @@ if ($Action -eq 'offer-files') {
             throw 'A file offer must not contain file hashes.'
         }
     }
+    Assert-ReceivePaths $manifest $MessageId
 
-    foreach ($suffix in 'request', 'done', 'failed', 'canceled') {
-        Remove-Item -LiteralPath (Join-Path $demandRoot "$MessageId.$suffix") -Force -ErrorAction SilentlyContinue
-    }
     $offer = Join-Path $offerRoot "$MessageId.json"
+    $existingOffer = Test-Path -LiteralPath $offer -PathType Leaf
+    if ($existingOffer) {
+        $previousOffer = Read-Manifest $offer $MessageId -AllowMissingHash
+        if (
+            [int64]$previousOffer.totalBytes -ne [int64]$manifest.totalBytes -or
+            @($previousOffer.files).Count -ne @($manifest.files).Count
+        ) {
+            throw 'A repeated file offer changed.'
+        }
+        for ($index = 0; $index -lt @($manifest.files).Count; $index++) {
+            if (
+                [string]$previousOffer.files[$index].name -ne [string]$manifest.files[$index].name -or
+                [string]$previousOffer.files[$index].kind -ne [string]$manifest.files[$index].kind -or
+                [int64]$previousOffer.files[$index].size -ne [int64]$manifest.files[$index].size
+            ) {
+                throw 'A repeated file offer changed.'
+            }
+        }
+    } else {
+        foreach ($suffix in 'request', 'done', 'failed', 'canceled') {
+            Remove-Item -LiteralPath (Join-Path $demandRoot "$MessageId.$suffix") -Force -ErrorAction SilentlyContinue
+        }
+        Remove-Item -LiteralPath `
+            (Join-Path $cancelRoot "$MessageId.request"), `
+            (Join-Path $cancelRoot "$MessageId.canceled") `
+            -Force -ErrorAction SilentlyContinue
+    }
     $message = Join-Path $inboxRoot "$MessageId.files-offer.msg"
     Copy-Item -LiteralPath $upload -Destination $offer -Force
     Move-Item -LiteralPath $upload -Destination $message -Force
@@ -259,30 +419,59 @@ if ($Action -eq 'offer-files') {
 
 if ($Action -eq 'drop-offer') {
     Assert-MessageId $MessageId
-    Remove-Item -LiteralPath (Join-Path $offerRoot "$MessageId.json") -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath (Join-Path $inboxRoot "$MessageId.files-offer.msg") -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath (Join-Path $demandRoot "$MessageId.request") -Force -ErrorAction SilentlyContinue
-    [IO.File]::WriteAllText(
-        (Join-Path $demandRoot "$MessageId.failed"),
-        'dismissed',
-        [Text.UTF8Encoding]::new($false)
+    $activeTransfer = (
+        (Test-Path -LiteralPath (Join-Path $incomingRoot $MessageId)) -or
+        (Test-Path -LiteralPath (Join-Path $demandRoot "$MessageId.request"))
     )
-    $temporary = Join-Path $inboxRoot "$MessageId.files-dismiss.tmp"
-    $message = Join-Path $inboxRoot "$MessageId.files-dismiss.msg"
-    [IO.File]::WriteAllText(
-        $temporary,
-        'dismiss',
-        [Text.UTF8Encoding]::new($false)
-    )
-    Move-Item -LiteralPath $temporary -Destination $message -Force
+    if ($activeTransfer) {
+        [IO.File]::WriteAllText(
+            (Join-Path $cancelRoot "$MessageId.request"),
+            'cancel',
+            [Text.UTF8Encoding]::new($false)
+        )
+    }
+    $messageMutex = Enter-MessageMutex $MessageId
+    try {
+        $state = Read-State $MessageId
+        if ($activeTransfer -and ($null -eq $state -or [string]$state.stage -ne 'Done')) {
+            [IO.File]::WriteAllText(
+                (Join-Path $cancelRoot "$MessageId.canceled"),
+                'canceled',
+                [Text.UTF8Encoding]::new($false)
+            )
+        }
+        Remove-Item -LiteralPath (Join-Path $offerRoot "$MessageId.json") -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath (Join-Path $inboxRoot "$MessageId.files-offer.msg") -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath (Join-Path $demandRoot "$MessageId.request") -Force -ErrorAction SilentlyContinue
+        [IO.File]::WriteAllText(
+            (Join-Path $demandRoot "$MessageId.failed"),
+            'dismissed',
+            [Text.UTF8Encoding]::new($false)
+        )
+        $temporary = Join-Path $inboxRoot "$MessageId.files-dismiss.tmp"
+        $message = Join-Path $inboxRoot "$MessageId.files-dismiss.msg"
+        [IO.File]::WriteAllText(
+            $temporary,
+            'dismiss',
+            [Text.UTF8Encoding]::new($false)
+        )
+        Move-Item -LiteralPath $temporary -Destination $message -Force
+    } finally {
+        Exit-MessageMutex $messageMutex
+    }
+    Remove-Item -LiteralPath (Join-Path $cancelRoot "$MessageId.request") -Force -ErrorAction SilentlyContinue
     Write-Output "ACK $MessageId"
     exit 0
 }
 
 if ($Action -eq 'begin-files') {
     Assert-MessageId $MessageId
+    if (Test-Path -LiteralPath (Join-Path $cancelRoot "$MessageId.canceled")) {
+        throw 'The file transfer was canceled.'
+    }
     $upload = Join-Path $root "upload.$MessageId.files.tmp"
     $manifest = Read-Manifest $upload $MessageId
+    Assert-ReceivePaths $manifest $MessageId
     $offerPath = Join-Path $offerRoot "$MessageId.json"
     if (Test-Path -LiteralPath $offerPath -PathType Leaf) {
         $offer = Read-Manifest $offerPath $MessageId -AllowMissingHash
@@ -295,6 +484,7 @@ if ($Action -eq 'begin-files') {
         for ($index = 0; $index -lt @($manifest.files).Count; $index++) {
             if (
                 [string]$offer.files[$index].name -ne [string]$manifest.files[$index].name -or
+                [string]$offer.files[$index].kind -ne [string]$manifest.files[$index].kind -or
                 [int64]$offer.files[$index].size -ne [int64]$manifest.files[$index].size
             ) {
                 throw 'The source files changed after they were copied.'
@@ -306,12 +496,20 @@ if ($Action -eq 'begin-files') {
         Remove-Item -LiteralPath $transferRoot -Recurse -Force
     }
     New-Item -ItemType Directory -Path $transferRoot | Out-Null
+    if (Test-Path -LiteralPath $offerPath -PathType Leaf) {
+        [IO.File]::WriteAllText(
+            (Join-Path $transferRoot 'lazy-offer.flag'),
+            'lazy',
+            [Text.UTF8Encoding]::new($false)
+        )
+    }
     Move-Item -LiteralPath $upload -Destination (Join-Path $transferRoot 'manifest.json')
     Remove-Item -LiteralPath (Join-Path $demandRoot "$MessageId.request") -Force -ErrorAction SilentlyContinue
-    $name = if (@($manifest.files).Count -eq 1) {
-        [string]$manifest.files[0].name
+    $topLevel = @($manifest.files | Where-Object { ([string]$_.name).IndexOf('/') -lt 0 })
+    $name = if ($topLevel.Count -eq 1) {
+        [string]$topLevel[0].name
     } else {
-        "$(@($manifest.files).Count) files"
+        "$($topLevel.Count) items"
     }
     Write-State $MessageId 'Transferring' 0 ([int64]$manifest.totalBytes) $name 'Receiving from Mac...' 'Receiving from Mac'
     Write-Output "READY $MessageId"
@@ -360,7 +558,7 @@ if ($Action -eq 'progress') {
     $message = switch ($Extra) {
         'Transferring' { 'Mac is receiving...' }
         'Verifying' { 'Mac is verifying files...' }
-        'Done' { 'Transfer complete.' }
+        'Done' { 'Transferred to the Mac cache; Finder is finalizing the paste.' }
         'Canceled' { 'Transfer canceled.' }
         default { 'Transfer failed.' }
     }
@@ -376,18 +574,30 @@ if ($Action -eq 'cancel-files') {
         'cancel',
         [Text.UTF8Encoding]::new($false)
     )
-    Remove-Item -LiteralPath (Join-Path $incomingRoot $MessageId) -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Outbound $MessageId
-    if (Test-Path -LiteralPath (Join-Path $offerRoot "$MessageId.json")) {
-        [IO.File]::WriteAllText(
-            (Join-Path $demandRoot "$MessageId.canceled"),
-            'canceled',
-            [Text.UTF8Encoding]::new($false)
-        )
-    }
-    $state = Read-State $MessageId
-    if ($null -ne $state) {
-        Write-State $MessageId 'Canceled' 0 ([int64]$state.total) ([string]$state.name) 'Transfer canceled.' ([string]$state.direction)
+    $messageMutex = Enter-MessageMutex $MessageId
+    try {
+        $state = Read-State $MessageId
+        if ($null -eq $state -or [string]$state.stage -ne 'Done') {
+            [IO.File]::WriteAllText(
+                (Join-Path $cancelRoot "$MessageId.canceled"),
+                'canceled',
+                [Text.UTF8Encoding]::new($false)
+            )
+            Remove-Item -LiteralPath (Join-Path $incomingRoot $MessageId) -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Outbound $MessageId
+            if (Test-Path -LiteralPath (Join-Path $offerRoot "$MessageId.json")) {
+                [IO.File]::WriteAllText(
+                    (Join-Path $demandRoot "$MessageId.canceled"),
+                    'canceled',
+                    [Text.UTF8Encoding]::new($false)
+                )
+            }
+            if ($null -ne $state) {
+                Write-State $MessageId 'Canceled' 0 ([int64]$state.total) ([string]$state.name) 'Transfer canceled.' ([string]$state.direction)
+            }
+        }
+    } finally {
+        Exit-MessageMutex $messageMutex
     }
     Remove-Item -LiteralPath (Join-Path $cancelRoot "$MessageId.request") -Force -ErrorAction SilentlyContinue
     Write-Output "ACK $MessageId"
@@ -434,6 +644,9 @@ if ($Action -eq 'commit-files') {
     Write-State $MessageId 'Verifying' ([int64]$manifest.totalBytes) ([int64]$manifest.totalBytes) $displayName 'Verifying files...' 'Receiving from Mac'
 
     foreach ($file in @($manifest.files)) {
+        if ([string]$file.kind -eq 'directory') {
+            continue
+        }
         $part = Join-Path $transferRoot ('{0:d6}.part' -f [int]$file.index)
         if (-not (Test-Path -LiteralPath $part -PathType Leaf)) {
             throw 'A transferred file is missing.'
@@ -447,41 +660,97 @@ if ($Action -eq 'commit-files') {
         }
     }
 
-    $destination = Join-Path (Join-Path $receiveRoot 'MacWinClip') $MessageId
-    New-Item -ItemType Directory -Force -Path $destination | Out-Null
-    $paths = @()
-    foreach ($file in @($manifest.files)) {
-        $part = Join-Path $transferRoot ('{0:d6}.part' -f [int]$file.index)
-        $final = Join-Path $destination ([string]$file.name)
-        Move-Item -LiteralPath $part -Destination $final
-        $paths += $final
+    $destinationRoot = Join-Path $receiveRoot 'MacWinClip'
+    $destination = Join-Path $destinationRoot $MessageId
+    $partialDestination = Join-Path $destinationRoot "$MessageId.partial"
+    New-Item -ItemType Directory -Force -Path $destinationRoot | Out-Null
+    if (Test-Path -LiteralPath $destination) {
+        throw 'The receive destination already exists.'
     }
-
-    $offerPath = Join-Path $offerRoot "$MessageId.json"
-    if (Test-Path -LiteralPath $offerPath -PathType Leaf) {
-        [IO.File]::WriteAllText(
-            (Join-Path $demandRoot "$MessageId.done"),
-            'done',
-            [Text.UTF8Encoding]::new($false)
-        )
-        Remove-Item -LiteralPath $offerPath -Force
-    } else {
-        $clipboardMessage = [ordered]@{
-            id = $MessageId
-            totalBytes = [int64]$manifest.totalBytes
-            paths = $paths
+    Remove-Item -LiteralPath $partialDestination -Recurse -Force -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Path $partialDestination | Out-Null
+    $partialPrefix = $partialDestination.TrimEnd('\') + '\'
+    $paths = @()
+    $messageMutex = $null
+    try {
+        foreach ($file in @($manifest.files)) {
+            if (
+                (Test-Path -LiteralPath (Join-Path $cancelRoot "$MessageId.request")) -or
+                (Test-Path -LiteralPath (Join-Path $cancelRoot "$MessageId.canceled"))
+            ) {
+                throw 'The file transfer was canceled.'
+            }
+            $relative = ([string]$file.name).Replace(
+                [char]'/', [IO.Path]::DirectorySeparatorChar
+            )
+            $final = [IO.Path]::GetFullPath((Join-Path $partialDestination $relative))
+            if (-not $final.StartsWith($partialPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+                throw 'A manifest path escaped the receive directory.'
+            }
+            if ([string]$file.kind -eq 'directory') {
+                New-Item -ItemType Directory -Force -Path $final | Out-Null
+                continue
+            }
+            $part = Join-Path $transferRoot ('{0:d6}.part' -f [int]$file.index)
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $final) | Out-Null
+            Move-Item -LiteralPath $part -Destination $final
         }
-        $temporary = Join-Path $inboxRoot "$MessageId.files.tmp"
-        $message = Join-Path $inboxRoot "$MessageId.files.msg"
-        [IO.File]::WriteAllText(
-            $temporary,
-            ($clipboardMessage | ConvertTo-Json -Depth 4 -Compress),
-            [Text.UTF8Encoding]::new($false)
-        )
-        Move-Item -LiteralPath $temporary -Destination $message -Force
+        foreach ($file in @($manifest.files)) {
+            if (([string]$file.name).IndexOf('/') -ge 0) {
+                continue
+            }
+            $relative = ([string]$file.name).Replace(
+                [char]'/', [IO.Path]::DirectorySeparatorChar
+            )
+            $paths += [IO.Path]::GetFullPath((Join-Path $destination $relative))
+        }
+
+        $messageMutex = Enter-MessageMutex $MessageId
+        if (
+            (Test-Path -LiteralPath (Join-Path $cancelRoot "$MessageId.request")) -or
+            (Test-Path -LiteralPath (Join-Path $cancelRoot "$MessageId.canceled"))
+        ) {
+            throw 'The file transfer was canceled.'
+        }
+        Move-Item -LiteralPath $partialDestination -Destination $destination
+
+        $offerPath = Join-Path $offerRoot "$MessageId.json"
+        $lazyTransfer = Test-Path -LiteralPath (Join-Path $transferRoot 'lazy-offer.flag') -PathType Leaf
+        if ($lazyTransfer -and (Test-Path -LiteralPath $offerPath -PathType Leaf)) {
+            [IO.File]::WriteAllText(
+                (Join-Path $demandRoot "$MessageId.done"),
+                'done',
+                [Text.UTF8Encoding]::new($false)
+            )
+            Remove-Item -LiteralPath $offerPath -Force
+        } elseif ($lazyTransfer) {
+            throw 'The lazy file offer was dismissed before commit.'
+        } else {
+            $clipboardMessage = [ordered]@{
+                id = $MessageId
+                totalBytes = [int64]$manifest.totalBytes
+                paths = $paths
+            }
+            $temporary = Join-Path $inboxRoot "$MessageId.files.tmp"
+            $message = Join-Path $inboxRoot "$MessageId.files.msg"
+            [IO.File]::WriteAllText(
+                $temporary,
+                ($clipboardMessage | ConvertTo-Json -Depth 4 -Compress),
+                [Text.UTF8Encoding]::new($false)
+            )
+            Move-Item -LiteralPath $temporary -Destination $message -Force
+        }
+        Write-State $MessageId 'Done' ([int64]$manifest.totalBytes) ([int64]$manifest.totalBytes) $displayName 'Transfer complete.' 'Receiving from Mac'
+    } catch {
+        Remove-Item -LiteralPath $partialDestination -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $destination -Recurse -Force -ErrorAction SilentlyContinue
+        throw
+    } finally {
+        if ($null -ne $messageMutex) {
+            Exit-MessageMutex $messageMutex
+        }
     }
     Remove-Item -LiteralPath $transferRoot -Recurse -Force -ErrorAction SilentlyContinue
-    Write-State $MessageId 'Done' ([int64]$manifest.totalBytes) ([int64]$manifest.totalBytes) $displayName 'Transfer complete.' 'Receiving from Mac'
     Write-Output "ACK $MessageId"
     exit 0
 }
@@ -529,7 +798,7 @@ while ([DateTime]::UtcNow -lt $deadline) {
         Select-Object -First 1
 
     if ($null -ne $outbound) {
-        $match = [regex]::Match($outbound.Name, '^outbound\.([a-f0-9]{32})\.(text|png|files)\.msg$')
+        $match = [regex]::Match($outbound.Name, '^outbound\.([a-f0-9]{32})\.(text|png|files|files-offer|files-failed|files-withdraw)\.msg$')
         $legacyMatch = [regex]::Match($outbound.Name, '^outbound\.([a-f0-9]{32})\.msg$')
         if ($match.Success -or $legacyMatch.Success) {
             if ($match.Success) {
@@ -543,12 +812,25 @@ while ([DateTime]::UtcNow -lt $deadline) {
             if ($lastSentId -ne $id -or ($now - $lastSentAt).TotalSeconds -ge 1) {
                 try {
                     $bytes = [IO.File]::ReadAllBytes($outbound.FullName)
-                    $limit = Get-TypeLimit $payloadType
+                    $limit = if ($payloadType -in 'FILES-OFFER', 'FILES-FAILED', 'FILES-WITHDRAW') {
+                        $maxManifestBytes
+                    } else {
+                        Get-TypeLimit $payloadType
+                    }
                     if ($bytes.Length -eq 0 -or $bytes.Length -gt $limit) {
                         Remove-Item -LiteralPath $outbound.FullName -Force -ErrorAction SilentlyContinue
                     } else {
-                        $encoded = [Convert]::ToBase64String($bytes)
-                        Send-ProtocolLine "SET $id $payloadType $encoded"
+                        if ($payloadType -eq 'FILES-OFFER') {
+                            $encoded = [Convert]::ToBase64String($bytes)
+                            Send-ProtocolLine "OFFER $id FILES $encoded"
+                        } elseif ($payloadType -eq 'FILES-FAILED') {
+                            Send-ProtocolLine "FAILED $id FILES"
+                        } elseif ($payloadType -eq 'FILES-WITHDRAW') {
+                            Send-ProtocolLine "WITHDRAW $id FILES"
+                        } else {
+                            $encoded = [Convert]::ToBase64String($bytes)
+                            Send-ProtocolLine "SET $id $payloadType $encoded"
+                        }
                         $lastSentId = $id
                         $lastSentAt = $now
                     }
