@@ -306,7 +306,7 @@ try {
             Sort-Object Name
 
         foreach ($message in $messages) {
-            $match = [regex]::Match($message.Name, '^([a-f0-9]{32})\.(text|png|files|files-offer)\.msg$')
+            $match = [regex]::Match($message.Name, '^([a-f0-9]{32})\.(text|png|files|files-offer|files-dismiss)\.msg$')
             if (-not $match.Success) {
                 continue
             }
@@ -314,6 +314,16 @@ try {
             $messageId = $match.Groups[1].Value
             $type = $match.Groups[2].Value.ToUpperInvariant()
             try {
+                if ($type -eq 'FILES-DISMISS') {
+                    if ($messageId -eq $lazyFileMessageId) {
+                        [Windows.Forms.Clipboard]::Clear()
+                        $lazyFileClipboard = $null
+                        $lazyFileMessageId = ''
+                        $lastSequence = Get-ClipboardSequence
+                    }
+                    Remove-Item -LiteralPath $message.FullName -Force
+                    continue
+                }
                 $bytes = [IO.File]::ReadAllBytes($message.FullName)
                 if ($type -eq 'FILES-OFFER') {
                     if ($bytes.Length -eq 0 -or $bytes.Length -gt $maxTextBytes) {
@@ -336,6 +346,8 @@ try {
                     Remove-Item -LiteralPath $message.FullName -Force
                     continue
                 }
+                $lazyFileClipboard = $null
+                $lazyFileMessageId = ''
                 Set-ClipboardSnapshot $type $bytes
                 $lastSequence = Get-ClipboardSequence
                 Remove-Item -LiteralPath $message.FullName -Force

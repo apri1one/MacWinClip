@@ -342,6 +342,15 @@ try {
     ) 'Lazy clipboard did not return a file stream after transfer completion.'
     [void][Runtime.InteropServices.Marshal]::Release($contentMedium.unionmember)
 
+    $dropped = & (Join-Path $relayRoot 'remote.ps1') drop-offer $macFilesId
+    Assert-True ($dropped -eq "ACK $macFilesId") 'Lazy file offer dismissal was not acknowledged.'
+    Assert-True (
+        Test-Path -LiteralPath (Join-Path $relayRoot "inbox\$macFilesId.files-dismiss.msg")
+    ) 'Lazy file offer dismissal was not queued for the GUI agent.'
+    Assert-True (
+        Test-Path -LiteralPath (Join-Path $relayRoot "file-demands\$macFilesId.failed")
+    ) 'Lazy file offer dismissal did not create a failure marker.'
+
     $unsafeFilesId = [Guid]::NewGuid().ToString('N')
     $unsafeManifest = [ordered]@{
         version = 1
