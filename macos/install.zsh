@@ -75,7 +75,7 @@ remote_scp_root="${remote_install_root//\\//}"
 health_command="powershell -NoProfile -ExecutionPolicy Bypass -File \"$remote_script\" health"
 health="$(ssh -T -o BatchMode=yes -o ConnectTimeout=8 -o ClearAllForwardings=yes "$ssh_target" "$health_command")"
 health="${health%$'\r'}"
-if [[ ! "$health" =~ '^OK V5 [1-9][0-9]*$' ]]; then
+if [[ ! "$health" =~ '^OK V[0-9]+ [1-9][0-9]*$' ]]; then
   print -u2 -- "Windows bridge health check failed. Run windows/install.ps1 on Windows first."
   exit 1
 fi
@@ -107,6 +107,13 @@ chmod 700 "$app_dir/progress-ui"
   printf 'PROGRESS_UI=%q\n' "$app_dir/progress-ui"
   printf 'CLIPBOARD_CHECK_INTERVAL=%q\n' "0.2"
   printf 'RECONNECT_INTERVAL=%q\n' "1"
+  printf 'RECONNECT_MAX_INTERVAL=%q\n' "300"
+  printf 'HEALTH_CHECK_INTERVAL=%q\n' "15"
+  printf 'HEALTH_COMMAND_TIMEOUT=%q\n' "8"
+  printf 'HEALTH_FAILURE_THRESHOLD=%q\n' "3"
+  printf 'PROTOCOL_TIMEOUT=%q\n' "20"
+  printf 'RECOVERY_BASE_INTERVAL=%q\n' "10"
+  printf 'RECOVERY_MAX_INTERVAL=%q\n' "300"
   printf 'MAX_TEXT_BYTES=%q\n' "1048576"
   printf 'MAX_IMAGE_BYTES=%q\n' "16777216"
   printf 'MAX_MANIFEST_BYTES=%q\n' "1048576"

@@ -90,7 +90,9 @@ Set-ExecutionPolicy -Scope Process Bypass
 %LOCALAPPDATA%\MacWindowsSSHClipboard
 ```
 
-安装器会收紧目录 ACL、启动桌面 Agent，并为当前用户创建登录启动项。
+安装器会收紧目录 ACL、启动桌面 Supervisor 与 Agent，并为当前用户创建
+仅在交互式登录会话中运行的计划任务。Supervisor 只在非 0 GUI 会话中按
+指数退避重启 Agent；SSH/Session 0 进程仍不访问桌面剪贴板。
 
 如果只想当前登录期间使用，不希望下次登录自动启动：
 
@@ -130,7 +132,8 @@ Windows 状态：
 & "$env:LOCALAPPDATA\MacWindowsSSHClipboard\status.ps1"
 ```
 
-应看到 `Running = True`，且 `SessionId` 不是 `0`。
+应看到 `Running = True`、`SupervisorRunning = True`，且 `SessionId`
+不是 `0`。`HealthState` 为 `healthy` 时，Windows 自愈状态正常。
 文件传输期间 `ActiveFileTransfers` 会大于 `0`。
 
 Mac 状态：
@@ -145,7 +148,22 @@ Mac 状态：
 running=yes
 ssh_target_configured=yes
 windows_reachable=yes
+self_heal_state=healthy
 ```
+
+Mac 会同时检查持续流的协议 `PING` 和 Windows GUI Agent 的 `health`。
+连续失败会重建 SSH 流、请求 Windows 交互式恢复任务，并以最长 5 分钟的
+指数退避继续尝试，避免睡眠恢复或长时间离线时形成重启风暴。状态文件和
+结构化日志位于：
+
+```text
+~/Library/Caches/mac-windows-ssh-clipboard/health.json
+~/Library/Caches/mac-windows-ssh-clipboard/health.jsonl
+```
+
+Windows 对应状态和日志为安装目录下的 `health-state.json` 与
+`health.jsonl`。这些日志只记录固定状态码、时间和失败计数，不记录剪贴板
+正文、文件名、token 或密钥。
 
 停止或重新启动 Windows Agent：
 

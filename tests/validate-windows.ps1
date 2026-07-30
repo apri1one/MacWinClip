@@ -5,11 +5,23 @@ $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('mwsc-validation-' + [Guid]::N
 $installRoot = Join-Path $testRoot 'installed'
 $startupRoot = Join-Path $testRoot 'startup'
 $receiveRoot = Join-Path $testRoot 'downloads'
+$recoveryTaskName = 'MacWinClip Validation ' + [Guid]::NewGuid().ToString('N')
 $process = $null
 
 function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) {
         throw $Message
+    }
+}
+
+function Invoke-TaskScheduler([string[]]$Arguments) {
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'SilentlyContinue'
+        & "$env:WINDIR\System32\schtasks.exe" @Arguments *> $null
+        return $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousPreference
     }
 }
 
@@ -53,25 +65,29 @@ try {
         -InstallRoot $installRoot `
         -StartupDirectory $startupRoot `
         -ReceiveRoot $receiveRoot `
+        -RecoveryTaskName $recoveryTaskName `
         -NoStart
 
-    foreach ($name in 'agent.ps1', 'file-worker.ps1', 'lazy-files.cs', 'progress.ps1', 'remote.ps1', 'start.ps1', 'stop.ps1', 'status.ps1', 'uninstall.ps1', 'receive-root.txt') {
+    foreach ($name in 'agent.ps1', 'file-worker.ps1', 'lazy-files.cs', 'progress.ps1', 'remote.ps1', 'start.ps1', 'stop.ps1', 'supervisor.ps1', 'status.ps1', 'uninstall.ps1', 'receive-root.txt', 'recovery-task-name.txt') {
         Assert-True (Test-Path -LiteralPath (Join-Path $installRoot $name)) "Missing installed file: $name"
     }
 
     $shortcutPath = Join-Path $startupRoot 'MacWindowsSSHClipboard.lnk'
-    Assert-True (Test-Path -LiteralPath $shortcutPath) 'Startup shortcut was not created.'
-    $shell = New-Object -ComObject WScript.Shell
-    $shortcut = $shell.CreateShortcut($shortcutPath)
-    Assert-True ($shortcut.Arguments -like "*$installRoot\start.ps1*") 'Startup shortcut targets the wrong install.'
+    Assert-True (-not (Test-Path -LiteralPath $shortcutPath)) 'Legacy startup shortcut was left installed.'
+    Assert-True (
+        (Invoke-TaskScheduler @('/Query', '/TN', $recoveryTaskName)) -eq 0
+    ) 'Interactive recovery task was not created.'
 
     & (Join-Path $projectRoot 'windows\install.ps1') `
         -InstallRoot $installRoot `
         -StartupDirectory $startupRoot `
         -ReceiveRoot $receiveRoot `
+        -RecoveryTaskName $recoveryTaskName `
         -NoStart `
         -NoAutoStart
-    Assert-True (-not (Test-Path -LiteralPath $shortcutPath)) 'NoAutoStart left the startup shortcut installed.'
+    Assert-True (
+        (Invoke-TaskScheduler @('/Query', '/TN', $recoveryTaskName)) -ne 0
+    ) 'NoAutoStart left the recovery task installed.'
 
     $acl = [IO.Directory]::GetAccessControl($installRoot)
     Assert-True $acl.AreAccessRulesProtected 'Install directory still inherits ACL entries.'
@@ -414,7 +430,8 @@ try {
 
     & (Join-Path $installRoot 'uninstall.ps1') `
         -InstallRoot $installRoot `
-        -StartupDirectory $startupRoot
+        -StartupDirectory $startupRoot `
+        -RecoveryTaskName $recoveryTaskName
     Assert-True (-not (Test-Path -LiteralPath $installRoot)) 'Uninstall left the application directory.'
     Assert-True (-not (Test-Path -LiteralPath $shortcutPath)) 'Uninstall left the startup shortcut.'
 
@@ -435,4 +452,5 @@ try {
     ) {
         Remove-Item -LiteralPath $resolvedTest -Recurse -Force -ErrorAction SilentlyContinue
     }
+    [void](Invoke-TaskScheduler @('/Delete', '/TN', $recoveryTaskName, '/F'))
 }

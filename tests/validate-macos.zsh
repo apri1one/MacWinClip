@@ -15,6 +15,11 @@ for script in "$project_root"/macos/*.zsh; do
   /bin/zsh -n "$script"
 done
 
+grep -Fq 'protocol_timeout' "$project_root/macos/bridge.zsh"
+grep -Fq 'windows_health_check' "$project_root/macos/bridge.zsh"
+grep -Fq 'request_windows_recovery' "$project_root/macos/bridge.zsh"
+grep -Fq 'health.jsonl' "$project_root/macos/bridge.zsh"
+
 mkdir -p "$test_root/empty-home"
 set +e
 HOME="$test_root/empty-home" /bin/zsh "$project_root/macos/file-transfer.zsh" \

@@ -21,8 +21,68 @@ transfer_dir="$runtime_dir/transfers"
 completion_dir="$runtime_dir/completed"
 outbound_file="$runtime_dir/outbound.payload"
 inbound_file="$runtime_dir/inbound.payload"
+health_state_file="$runtime_dir/health.json"
+health_log_file="$runtime_dir/health.jsonl"
 mkdir -p "$runtime_dir" "$transfer_dir" "$completion_dir"
 chmod 700 "$runtime_dir" "$transfer_dir" "$completion_dir"
+
+json_escape() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  value="${value//$'\r'/\\r}"
+  value="${value//$'\t'/\\t}"
+  print -rn -- "$value"
+}
+
+rotate_health_log() {
+  local size
+  [[ -f "$health_log_file" ]] || return 0
+  size="$(wc -c < "$health_log_file" | tr -d ' ')" || return 0
+  if [[ "$size" == <-> ]] && (( size >= ${HEALTH_LOG_MAX_BYTES:-1048576} )); then
+    mv -f "$health_log_file" "$health_log_file.1"
+  fi
+}
+
+log_health_event() {
+  local level="$1"
+  local event="$2"
+  local state="$3"
+  local failures="$4"
+  local detail="$5"
+  local timestamp
+  timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  rotate_health_log
+  printf '{"timestampUtc":"%s","level":"%s","event":"%s","state":"%s","failures":%s,"detail":"%s"}\n' \
+    "$(json_escape "$timestamp")" \
+    "$(json_escape "$level")" \
+    "$(json_escape "$event")" \
+    "$(json_escape "$state")" \
+    "$failures" \
+    "$(json_escape "$detail")" \
+    >> "$health_log_file"
+  chmod 600 "$health_log_file"
+}
+
+write_health_state() {
+  local state="$1"
+  local failures="$2"
+  local next_retry_seconds="$3"
+  local detail="$4"
+  local timestamp temporary
+  timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  temporary="$health_state_file.tmp"
+  printf '{"updatedUtc":"%s","state":"%s","failures":%s,"nextRetrySeconds":%s,"detail":"%s"}\n' \
+    "$(json_escape "$timestamp")" \
+    "$(json_escape "$state")" \
+    "$failures" \
+    "$next_retry_seconds" \
+    "$(json_escape "$detail")" \
+    > "$temporary"
+  chmod 600 "$temporary"
+  mv -f "$temporary" "$health_state_file"
+}
 
 cleanup() {
   local pid_file message_id attempt owner_pid
@@ -75,6 +135,35 @@ remote_action_command() {
   local action="$1"
   shift
   print -r -- "powershell -NoProfile -ExecutionPolicy Bypass -File \"$WINDOWS_REMOTE_SCRIPT\" $action $*"
+}
+
+remote_action() {
+  ssh "${ssh_options[@]}" "$SSH_TARGET" \
+    "$(remote_action_command "$@")" 2>/dev/null
+}
+
+remote_action_with_timeout() {
+  local timeout_seconds="$1"
+  shift
+  /usr/bin/perl -e \
+    'my $timeout = shift @ARGV; alarm $timeout; exec @ARGV' \
+    "$timeout_seconds" \
+    ssh "${ssh_options[@]}" "$SSH_TARGET" \
+    "$(remote_action_command "$@")" 2>/dev/null
+}
+
+windows_health_check() {
+  local response
+  response="$(remote_action_with_timeout "${HEALTH_COMMAND_TIMEOUT:-8}" health)" || return 1
+  response="${response%$'\r'}"
+  [[ "$response" =~ '^OK V[0-9]+ [1-9][0-9]*$' ]]
+}
+
+request_windows_recovery() {
+  local response
+  response="$(remote_action_with_timeout "${HEALTH_COMMAND_TIMEOUT:-8}" recover)" || return 1
+  response="${response%$'\r'}"
+  [[ "$response" == "RECOVERY REQUESTED" ]]
 }
 
 clipboard_change_count() {
@@ -321,7 +410,11 @@ receive_protocol_line() {
     return
   fi
 
-  if [[ "$line" == "PING" || "$line" != SET\ *\ *\ * ]]; then
+  if [[ "$line" == "PING" ]]; then
+    last_protocol_tick=$SECONDS
+    return
+  fi
+  if [[ "$line" != SET\ *\ *\ * ]]; then
     return
   fi
 
@@ -432,15 +525,83 @@ remote_file_drop_retry_ticks=0
 last_received_id=""
 active_receive_id=""
 
+health_interval="${HEALTH_CHECK_INTERVAL:-15}"
+protocol_timeout="${PROTOCOL_TIMEOUT:-20}"
+health_failure_threshold="${HEALTH_FAILURE_THRESHOLD:-3}"
+reconnect_max_interval="${RECONNECT_MAX_INTERVAL:-300}"
+recovery_base_interval="${RECOVERY_BASE_INTERVAL:-10}"
+recovery_max_interval="${RECOVERY_MAX_INTERVAL:-300}"
+health_failures=0
+reconnect_failures=0
+recovery_interval="$recovery_base_interval"
+next_recovery_tick=0
+write_health_state "starting" 0 0 "bridge_starting"
+log_health_event "info" "bridge_started" "starting" 0 "bridge_starting"
+
 while true; do
+  session_healthy=0
+  last_protocol_tick=$SECONDS
+  next_health_tick=$(( SECONDS + 1 ))
+  write_health_state "connecting" "$health_failures" 0 "stream_starting"
   coproc ssh "${ssh_options[@]}" "$SSH_TARGET" "$(remote_action_command stream)"
   ssh_pid=$!
+  log_health_event "info" "stream_started" "connecting" "$health_failures" "stream_started"
 
   while kill -0 "$ssh_pid" 2>/dev/null; do
     while IFS= read -r -t 0.01 -p protocol_line; do
       protocol_line="${protocol_line%$'\r'}"
       receive_protocol_line "$protocol_line"
     done
+
+    if (( SECONDS - last_protocol_tick > protocol_timeout )); then
+      (( health_failures += 1 ))
+      log_health_event "error" "protocol_timeout" "degraded" "$health_failures" "stream_ping_timeout"
+      write_health_state "degraded" "$health_failures" 0 "stream_ping_timeout"
+      kill "$ssh_pid" 2>/dev/null || true
+      break
+    fi
+
+    if (( SECONDS >= next_health_tick )); then
+      if windows_health_check; then
+        if (( health_failures > 0 || session_healthy == 0 )); then
+          log_health_event "info" "health_recovered" "healthy" 0 "protocol_and_agent_healthy"
+        fi
+        health_failures=0
+        reconnect_failures=0
+        recovery_interval="$recovery_base_interval"
+        next_recovery_tick=0
+        session_healthy=1
+        write_health_state "healthy" 0 0 "protocol_and_agent_healthy"
+      else
+        (( health_failures += 1 ))
+        state="degraded"
+        (( health_failures >= health_failure_threshold )) && state="failed"
+        log_health_event "error" "health_failed" "$state" "$health_failures" "windows_agent_unhealthy"
+        write_health_state "$state" "$health_failures" 0 "windows_agent_unhealthy"
+        if (( health_failures >= health_failure_threshold )); then
+          if (( SECONDS >= next_recovery_tick )); then
+            if request_windows_recovery; then
+              log_health_event "info" "windows_recovery_requested" "recovering" \
+                "$health_failures" "recovery_task_requested"
+              write_health_state "recovering" "$health_failures" \
+                "$recovery_interval" "recovery_task_requested"
+            else
+              log_health_event "error" "windows_recovery_failed" "failed" \
+                "$health_failures" "recovery_task_unavailable"
+              write_health_state "failed" "$health_failures" \
+                "$recovery_interval" "recovery_task_unavailable"
+            fi
+            next_recovery_tick=$(( SECONDS + recovery_interval ))
+            recovery_interval=$(( recovery_interval * 2 ))
+            (( recovery_interval > recovery_max_interval )) &&
+              recovery_interval="$recovery_max_interval"
+          fi
+          kill "$ssh_pid" 2>/dev/null || true
+          break
+        fi
+      fi
+      next_health_tick=$(( SECONDS + health_interval ))
+    fi
 
     process_file_completions
 
@@ -479,5 +640,25 @@ while true; do
   done
 
   wait "$ssh_pid" 2>/dev/null || true
-  sleep "${RECONNECT_INTERVAL:-1}"
+  if (( session_healthy == 0 )); then
+    (( reconnect_failures += 1 ))
+  fi
+  reconnect_delay="${RECONNECT_INTERVAL:-1}"
+  if (( reconnect_failures > 1 )); then
+    reconnect_exponent=$(( reconnect_failures - 1 ))
+    (( reconnect_exponent > 8 )) && reconnect_exponent=8
+    reconnect_delay=$(( reconnect_delay * (2 ** reconnect_exponent) ))
+  fi
+  (( reconnect_delay > reconnect_max_interval )) &&
+    reconnect_delay="$reconnect_max_interval"
+  visible_failures="$health_failures"
+  (( reconnect_failures > visible_failures )) &&
+    visible_failures="$reconnect_failures"
+  state="connecting"
+  (( visible_failures >= health_failure_threshold )) && state="failed"
+  log_health_event "info" "stream_reconnect_wait" "$state" \
+    "$visible_failures" "stream_reconnect_backoff"
+  write_health_state "$state" "$visible_failures" \
+    "$reconnect_delay" "stream_reconnect_backoff"
+  sleep "$reconnect_delay"
 done

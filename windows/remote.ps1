@@ -2,6 +2,7 @@ param(
     [Parameter(Mandatory = $true, Position = 0)]
     [ValidateSet(
         'health',
+        'recover',
         'stream',
         'receive',
         'offer-files',
@@ -65,6 +66,17 @@ function Get-TypeLimit([string]$PayloadType) {
 function Send-ProtocolLine([string]$Line) {
     [Console]::Out.WriteLine($Line)
     [Console]::Out.Flush()
+}
+
+function Invoke-TaskScheduler([string[]]$Arguments) {
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'SilentlyContinue'
+        & "$env:WINDIR\System32\schtasks.exe" @Arguments *> $null
+        return $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
 }
 
 function Get-StatePath([string]$Id) {
@@ -192,6 +204,35 @@ if ($Action -eq 'health') {
         exit 1
     }
     Write-Output "OK V5 $($agentProcess.SessionId)"
+    exit 0
+}
+
+if ($Action -eq 'recover') {
+    $taskNamePath = Join-Path $root 'recovery-task-name.txt'
+    $taskName = if (Test-Path -LiteralPath $taskNamePath -PathType Leaf) {
+        (Get-Content -LiteralPath $taskNamePath -Raw -Encoding UTF8).Trim()
+    } else {
+        'MacWindowsSSHClipboard Recovery'
+    }
+    if ([string]::IsNullOrWhiteSpace($taskName)) {
+        Write-Output 'RECOVERY UNAVAILABLE'
+        exit 1
+    }
+    $requestPath = Join-Path $root 'supervisor.recover.request'
+    [IO.File]::WriteAllText(
+        $requestPath,
+        'recover',
+        [Text.UTF8Encoding]::new($false)
+    )
+    if ((Invoke-TaskScheduler @('/Query', '/TN', $taskName)) -ne 0) {
+        Write-Output 'RECOVERY UNAVAILABLE'
+        exit 1
+    }
+    if ((Invoke-TaskScheduler @('/Run', '/TN', $taskName)) -ne 0) {
+        Write-Output 'RECOVERY FAILED'
+        exit 1
+    }
+    Write-Output 'RECOVERY REQUESTED'
     exit 0
 }
 
