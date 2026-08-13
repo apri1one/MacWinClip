@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('PrepareOutbound')]
+    [ValidateSet('OfferOutbound', 'PrepareOutbound')]
     [string]$Mode,
 
     [Parameter(Mandatory = $true)]
@@ -12,18 +12,27 @@ $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 $requestRoot = Join-Path $root 'file-requests'
 $outgoingRoot = Join-Path $root 'outgoing'
+$offerRoot = Join-Path $root 'outbound-file-offers'
+$demandRoot = Join-Path $root 'outbound-file-demands'
 $progressRoot = Join-Path $root 'progress'
 $cancelRoot = Join-Path $root 'cancel'
 $requestPath = Join-Path $requestRoot "$MessageId.json"
 $transferRoot = Join-Path $outgoingRoot $MessageId
 $manifestTemporary = Join-Path $root "outbound.$MessageId.files.tmp"
 $manifestPath = Join-Path $root "outbound.$MessageId.files.msg"
+$offerTemporary = Join-Path $root "outbound.$MessageId.files-offer.tmp"
+$offerMessage = Join-Path $root "outbound.$MessageId.files-offer.msg"
+$offerPath = Join-Path $offerRoot "$MessageId.json"
+$failedTemporary = Join-Path $root "outbound.$MessageId.files-failed.tmp"
+$failedMessage = Join-Path $root "outbound.$MessageId.files-failed.msg"
+$demandPath = Join-Path $demandRoot "$MessageId.request"
+$demandStartedPath = Join-Path $demandRoot "$MessageId.started"
 $statePath = Join-Path $progressRoot "$MessageId.json"
 $cancelPath = Join-Path $cancelRoot "$MessageId.request"
 $workerPidFile = Join-Path $root "file-worker.$MessageId.pid"
 $maxFileBytes = [int64]10737418240
 
-foreach ($directory in $requestRoot, $outgoingRoot, $progressRoot, $cancelRoot) {
+foreach ($directory in $requestRoot, $outgoingRoot, $offerRoot, $demandRoot, $progressRoot, $cancelRoot) {
     New-Item -ItemType Directory -Force -Path $directory | Out-Null
 }
 [IO.File]::WriteAllText(
@@ -62,7 +71,7 @@ function Get-SafeName([string]$Name, [Collections.Generic.HashSet[string]]$UsedN
     if ([string]::IsNullOrWhiteSpace($safe)) {
         $safe = 'file'
     }
-    if ($safe -match '^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)') {
+    if ($safe -match '^(?i:CON|PRN|AUX|NUL|COM[1-9\u00B9\u00B2\u00B3]|LPT[1-9\u00B9\u00B2\u00B3])(?:\.|$)') {
         $safe = "_$safe"
     }
 
@@ -129,59 +138,180 @@ try {
     $request = Get-Content -LiteralPath $requestPath -Raw -Encoding UTF8 | ConvertFrom-Json
     $sources = @($request.sources)
     if ($sources.Count -eq 0 -or $sources.Count -gt 1000) {
-        throw 'File selection must contain between 1 and 1000 files.'
+        throw 'File selection must contain between 1 and 1000 items.'
     }
 
-    $items = @()
+    $items = [Collections.Generic.List[object]]::new()
     $total = [int64]0
     $usedNames = [Collections.Generic.HashSet[string]]::new(
         [StringComparer]::OrdinalIgnoreCase
     )
     foreach ($source in $sources) {
-        $item = Get-Item -LiteralPath ([string]$source) -Force
-        if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-            throw 'Folders and symbolic links are not supported.'
+        $rootItem = Get-Item -LiteralPath ([string]$source) -Force
+        if ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw 'Symbolic links and reparse points are not supported.'
         }
-        if ([int64]$item.Length -gt ($maxFileBytes - $total)) {
-            throw 'The selected files exceed the 10 GiB transfer limit.'
-        }
-        $total += [int64]$item.Length
-        $items += [pscustomobject]@{
-            Source = $item.FullName
-            Name = Get-SafeName $item.Name $usedNames
-            Size = [int64]$item.Length
+        $rootName = Get-SafeName $rootItem.Name $usedNames
+        $pending = [Collections.Generic.Queue[object]]::new()
+        $pending.Enqueue([pscustomobject]@{
+            Source = $rootItem.FullName
+            Name = $rootName
+        })
+
+        while ($pending.Count -gt 0) {
+            $current = $pending.Dequeue()
+            $item = Get-Item -LiteralPath $current.Source -Force
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw 'Symbolic links and reparse points are not supported.'
+            }
+            if ([string]$current.Name -match '(^|/)(\.|\.\.)($|/)' -or ([string]$current.Name).Length -gt 259) {
+                throw 'A relative path is unsafe or too long.'
+            }
+            foreach ($component in ([string]$current.Name).Split('/')) {
+                if ([Text.Encoding]::UTF8.GetByteCount($component) -gt 255) {
+                    throw 'A path component is too long for macOS.'
+                }
+            }
+            if ($items.Count -ge 1000) {
+                throw 'The selected directory tree exceeds the 1000 item limit.'
+            }
+
+            if ($item.PSIsContainer) {
+                [void]$items.Add([pscustomobject]@{
+                    Source = $item.FullName
+                    Name = [string]$current.Name
+                    Kind = 'directory'
+                    Size = [int64]0
+                })
+                $childNames = [Collections.Generic.HashSet[string]]::new(
+                    [StringComparer]::OrdinalIgnoreCase
+                )
+                $children = @(Get-ChildItem -LiteralPath $item.FullName -Force | Sort-Object Name)
+                foreach ($child in $children) {
+                    if ($child.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                        throw 'Symbolic links and reparse points are not supported.'
+                    }
+                    $childName = Get-SafeName $child.Name $childNames
+                    $pending.Enqueue([pscustomobject]@{
+                        Source = $child.FullName
+                        Name = "$($current.Name)/$childName"
+                    })
+                }
+            } else {
+                if ([int64]$item.Length -gt ($maxFileBytes - $total)) {
+                    throw 'The selected items exceed the 10 GiB transfer limit.'
+                }
+                $total += [int64]$item.Length
+                [void]$items.Add([pscustomobject]@{
+                    Source = $item.FullName
+                    Name = [string]$current.Name
+                    Kind = 'file'
+                    Size = [int64]$item.Length
+                })
+            }
         }
     }
 
-    if ($total -le 0) {
-        throw 'Empty files are not supported in the first file-transfer release.'
+    $displayName = if ($sources.Count -eq 1) { $items[0].Name } else { "$($sources.Count) items" }
+
+    $offerFiles = @()
+    for ($index = 0; $index -lt $items.Count; $index++) {
+        $offerFiles += [ordered]@{
+            index = $index
+            name = $items[$index].Name
+            kind = $items[$index].Kind
+            size = $items[$index].Size
+            sha256 = ''
+        }
+    }
+    $offerManifest = [ordered]@{
+        version = 2
+        id = $MessageId
+        totalBytes = $total
+        files = $offerFiles
+    }
+
+    if ($Mode -eq 'OfferOutbound') {
+        if (Test-Path -LiteralPath $cancelPath) {
+            throw [OperationCanceledException]::new('Transfer canceled.')
+        }
+        $offerJson = $offerManifest | ConvertTo-Json -Depth 5 -Compress
+        [IO.File]::WriteAllText(
+            "$offerPath.tmp",
+            $offerJson,
+            [Text.UTF8Encoding]::new($false)
+        )
+        Move-Item -LiteralPath "$offerPath.tmp" -Destination $offerPath -Force
+        [IO.File]::WriteAllText(
+            $offerTemporary,
+            $offerJson,
+            [Text.UTF8Encoding]::new($false)
+        )
+        Move-Item -LiteralPath $offerTemporary -Destination $offerMessage -Force
+        Remove-Item -LiteralPath $workerPidFile -Force -ErrorAction SilentlyContinue
+        exit 0
+    }
+
+    if (-not (Test-Path -LiteralPath $offerPath -PathType Leaf)) {
+        throw 'The file offer is missing.'
+    }
+    $previousOffer = Get-Content -LiteralPath $offerPath -Raw -Encoding UTF8 |
+        ConvertFrom-Json
+    if (
+        [int]$previousOffer.version -ne 2 -or
+        [string]$previousOffer.id -ne $MessageId -or
+        [int64]$previousOffer.totalBytes -ne $total -or
+        @($previousOffer.files).Count -ne $items.Count
+    ) {
+        throw 'The selected files changed after they were copied.'
+    }
+    for ($index = 0; $index -lt $items.Count; $index++) {
+        if (
+            [int]$previousOffer.files[$index].index -ne $index -or
+            [string]$previousOffer.files[$index].name -ne [string]$items[$index].Name -or
+            [string]$previousOffer.files[$index].kind -ne [string]$items[$index].Kind -or
+            [int64]$previousOffer.files[$index].size -ne [int64]$items[$index].Size
+        ) {
+            throw 'The selected files changed after they were copied.'
+        }
     }
 
     New-Item -ItemType Directory -Force -Path $transferRoot | Out-Null
-    $displayName = if ($items.Count -eq 1) { $items[0].Name } else { "$($items.Count) files" }
-    Write-State 'Preparing' 0 $total $displayName 'Preparing files...'
+    Write-State 'Preparing' 0 $total $displayName 'Preparing files after paste request...'
 
     $transferred = [int64]0
     $manifestFiles = @()
     for ($index = 0; $index -lt $items.Count; $index++) {
-        $payloadName = '{0:d6}.payload' -f $index
-        $payloadPath = Join-Path $transferRoot $payloadName
-        $hash = Copy-WithHash `
-            $items[$index].Source `
-            $payloadPath `
-            ([ref]$transferred) `
-            $total `
-            $displayName
+        $hash = ''
+        if ($items[$index].Kind -eq 'file') {
+            $currentItem = Get-Item -LiteralPath $items[$index].Source -Force
+            if (
+                $currentItem.PSIsContainer -or
+                ($currentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                [int64]$currentItem.Length -ne [int64]$items[$index].Size
+            ) {
+                throw 'A source file changed after it was selected.'
+            }
+            $payloadName = '{0:d6}.payload' -f $index
+            $payloadPath = Join-Path $transferRoot $payloadName
+            $hash = Copy-WithHash `
+                $items[$index].Source `
+                $payloadPath `
+                ([ref]$transferred) `
+                $total `
+                $displayName
+        }
         $manifestFiles += [ordered]@{
             index = $index
             name = $items[$index].Name
+            kind = $items[$index].Kind
             size = $items[$index].Size
             sha256 = $hash
         }
     }
 
     $manifest = [ordered]@{
-        version = 1
+        version = 2
         id = $MessageId
         totalBytes = $total
         files = $manifestFiles
@@ -192,15 +322,33 @@ try {
         [Text.UTF8Encoding]::new($false)
     )
     Move-Item -LiteralPath $manifestTemporary -Destination $manifestPath -Force
-    Remove-Item -LiteralPath $requestPath -Force
+    Remove-Item -LiteralPath $demandPath, $demandStartedPath -Force -ErrorAction SilentlyContinue
     Write-State 'Waiting' $total $total $displayName 'Waiting for Mac...'
 } catch [OperationCanceledException] {
     Remove-Item -LiteralPath $transferRoot -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $requestPath, $manifestTemporary, $manifestPath -Force -ErrorAction SilentlyContinue
-    Write-State 'Canceled' 0 0 '' 'Transfer canceled.'
+    Remove-Item -LiteralPath $requestPath, $manifestTemporary, $manifestPath, $offerTemporary, $offerMessage, $offerPath, $demandPath, $demandStartedPath -Force -ErrorAction SilentlyContinue
+    if ($Mode -eq 'PrepareOutbound') {
+        [IO.File]::WriteAllText(
+            $failedTemporary,
+            'failed',
+            [Text.UTF8Encoding]::new($false)
+        )
+        Move-Item -LiteralPath $failedTemporary -Destination $failedMessage -Force
+        Write-State 'Canceled' 0 0 '' 'Transfer canceled.'
+    }
 } catch {
     Remove-Item -LiteralPath $transferRoot -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $requestPath, $manifestTemporary, $manifestPath -Force -ErrorAction SilentlyContinue
-    Write-State 'Error' 0 0 '' $_.Exception.Message
+    Remove-Item -LiteralPath $requestPath, $manifestTemporary, $manifestPath, $offerTemporary, $offerMessage, $offerPath, $demandPath, $demandStartedPath -Force -ErrorAction SilentlyContinue
+    if ($Mode -eq 'PrepareOutbound') {
+        [IO.File]::WriteAllText(
+            $failedTemporary,
+            'failed',
+            [Text.UTF8Encoding]::new($false)
+        )
+        Move-Item -LiteralPath $failedTemporary -Destination $failedMessage -Force
+        Write-State 'Error' 0 0 '' $_.Exception.Message
+    } else {
+        Write-State 'Error' 0 0 '' $_.Exception.Message
+    }
 }
 Remove-Item -LiteralPath $workerPidFile -Force -ErrorAction SilentlyContinue

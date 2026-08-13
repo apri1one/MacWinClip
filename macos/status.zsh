@@ -38,3 +38,12 @@ if [[ -f "$health_state" ]] &&
 else
   print -- "self_heal_state=unknown"
 fi
+
+runtime_dir="$HOME/Library/Caches/mac-windows-ssh-clipboard"
+setopt null_glob
+owners=("$runtime_dir"/transfers/*.owner.pid)
+fetches=("$runtime_dir"/transfers/*.fetching)
+caches=("$runtime_dir"/received/*(/))
+print -- "pending_windows_file_offers=${#owners}"
+print -- "pending_windows_file_fetches=${#fetches}"
+print -- "cached_windows_transfers=${#caches}"

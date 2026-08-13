@@ -20,9 +20,11 @@ namespace MacWinClip
         private const int DV_E_TYMED = unchecked((int)0x80040069);
         private const int GMEM_MOVEABLE = 0x0002;
         private const int GMEM_ZEROINIT = 0x0040;
+        private const uint FILE_ATTRIBUTE_DIRECTORY = 0x00000010;
         private const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
         private const uint FD_ATTRIBUTES = 0x00000004;
         private const uint FD_FILESIZE = 0x00000040;
+        private const uint FD_UNICODE = 0x80000000;
         private const uint STGM_READ = 0x00000000;
         private const uint STGM_SHARE_DENY_NONE = 0x00000040;
         private const uint DROPEFFECT_COPY = 1;
@@ -37,6 +39,7 @@ namespace MacWinClip
         private readonly string messageId;
         private readonly string[] names;
         private readonly long[] sizes;
+        private readonly bool[] directories;
         private readonly string demandRoot;
         private readonly string destinationRoot;
         private readonly string progressScript;
@@ -49,6 +52,7 @@ namespace MacWinClip
             string messageId,
             string[] names,
             long[] sizes,
+            bool[] directories,
             string demandRoot,
             string destinationRoot,
             string progressScript,
@@ -59,14 +63,17 @@ namespace MacWinClip
                 String.IsNullOrEmpty(messageId) ||
                 names == null ||
                 sizes == null ||
+                directories == null ||
                 names.Length == 0 ||
-                names.Length != sizes.Length)
+                names.Length != sizes.Length ||
+                names.Length != directories.Length)
             {
                 throw new ArgumentException("Invalid lazy file offer.");
             }
             this.messageId = messageId;
             this.names = names;
             this.sizes = sizes;
+            this.directories = directories;
             this.demandRoot = demandRoot;
             this.destinationRoot = destinationRoot;
             this.progressScript = progressScript;
@@ -107,7 +114,10 @@ namespace MacWinClip
                 {
                     throw new COMException("Unsupported file-content medium.", DV_E_TYMED);
                 }
-                if (format.lindex < 0 || format.lindex >= names.Length)
+                if (
+                    format.lindex < 0 ||
+                    format.lindex >= names.Length ||
+                    directories[format.lindex])
                 {
                     throw new COMException("Invalid file index.", DV_E_FORMATETC);
                 }
@@ -166,7 +176,8 @@ namespace MacWinClip
                 format.cfFormat == FileContentsFormat &&
                 (format.tymed & TYMED.TYMED_ISTREAM) != 0 &&
                 format.lindex >= 0 &&
-                format.lindex < names.Length)
+                format.lindex < names.Length &&
+                !directories[format.lindex])
             {
                 return S_OK;
             }
@@ -338,6 +349,20 @@ namespace MacWinClip
 
         private IntPtr BuildFileGroupDescriptor()
         {
+            bool hasFile = false;
+            for (int index = 0; index < directories.Length; index++)
+            {
+                if (!directories[index])
+                {
+                    hasFile = true;
+                    break;
+                }
+            }
+            if (!hasFile)
+            {
+                EnsureRequested();
+            }
+
             int descriptorSize = Marshal.SizeOf(typeof(FILEDESCRIPTORW));
             int totalSize = sizeof(uint) + descriptorSize * names.Length;
             IntPtr handle = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, new UIntPtr((uint)totalSize));
@@ -356,14 +381,27 @@ namespace MacWinClip
                 Marshal.WriteInt32(pointer, names.Length);
                 for (int index = 0; index < names.Length; index++)
                 {
-                    FILEDESCRIPTORW descriptor = new FILEDESCRIPTORW
+                    FILEDESCRIPTORW descriptor;
+                    if (directories[index])
                     {
-                        dwFlags = FD_ATTRIBUTES | FD_FILESIZE,
-                        dwFileAttributes = FILE_ATTRIBUTE_NORMAL,
-                        nFileSizeHigh = unchecked((uint)(sizes[index] >> 32)),
-                        nFileSizeLow = unchecked((uint)sizes[index]),
-                        cFileName = names[index]
-                    };
+                        descriptor = new FILEDESCRIPTORW
+                        {
+                            dwFlags = FD_ATTRIBUTES | FD_UNICODE,
+                            dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY,
+                            cFileName = names[index].Replace('/', '\\')
+                        };
+                    }
+                    else
+                    {
+                        descriptor = new FILEDESCRIPTORW
+                        {
+                            dwFlags = FD_ATTRIBUTES | FD_FILESIZE | FD_UNICODE,
+                            dwFileAttributes = FILE_ATTRIBUTE_NORMAL,
+                            nFileSizeHigh = unchecked((uint)(sizes[index] >> 32)),
+                            nFileSizeLow = unchecked((uint)sizes[index]),
+                            cFileName = names[index].Replace('/', '\\')
+                        };
+                    }
                     Marshal.StructureToPtr(
                         descriptor,
                         IntPtr.Add(pointer, sizeof(uint) + index * descriptorSize),
@@ -457,6 +495,7 @@ namespace MacWinClip
             string messageId,
             string[] names,
             long[] sizes,
+            bool[] directories,
             string demandRoot,
             string destinationRoot,
             string progressScript,
@@ -467,6 +506,7 @@ namespace MacWinClip
                 messageId,
                 names,
                 sizes,
+                directories,
                 demandRoot,
                 destinationRoot,
                 progressScript,

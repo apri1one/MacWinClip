@@ -43,6 +43,12 @@ if (Test-Path -LiteralPath $healthStateFile -PathType Leaf) {
     HealthFailures = if ($null -ne $healthState) { [int]$healthState.failures } else { $null }
     PendingMacToWindows = @(Get-ChildItem -LiteralPath $inboxRoot -Filter '*.msg' -File -ErrorAction SilentlyContinue).Count
     PendingWindowsToMac = @(Get-ChildItem -LiteralPath $root -Filter 'outbound.*.msg' -File -ErrorAction SilentlyContinue).Count
+    PendingWindowsFileOffers = @(
+        Get-ChildItem -LiteralPath (Join-Path $root 'outbound-file-offers') -Filter '*.json' -File -ErrorAction SilentlyContinue
+    ).Count
+    PendingWindowsFileFetches = @(
+        Get-ChildItem -LiteralPath (Join-Path $root 'outbound-file-demands') -Filter '*.request' -File -ErrorAction SilentlyContinue
+    ).Count
     ActiveFileTransfers = @(
         Get-ChildItem -LiteralPath $progressRoot -Filter '*.json' -File -ErrorAction SilentlyContinue |
             Where-Object {
