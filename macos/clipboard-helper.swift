@@ -281,7 +281,13 @@ func exportClipboard(to path: String) throws {
         .urlReadingFileURLsOnly: true
     ]
     let fileNamesType = NSPasteboard.PasteboardType("NSFilenamesPboardType")
+    // 应用内「复制图片」（微信、浏览器等）会同时放入临时文件引用和图像数据，
+    // Finder 复制文件则只有文件引用。只有在完全没有图像数据时才按文件传输处理，
+    // 否则图片会被当成懒文件传输，无法在对端粘贴成图片。
+    let hasImageData = pasteboard.data(forType: .png) != nil
+        || pasteboard.data(forType: .tiff) != nil
     if
+        !hasImageData,
         let objects = pasteboard.readObjects(
             forClasses: [NSURL.self],
             options: options
@@ -301,6 +307,7 @@ func exportClipboard(to path: String) throws {
         return
     }
     if
+        !hasImageData,
         let filePaths = pasteboard.propertyList(forType: fileNamesType) as? [String],
         !filePaths.isEmpty
     {
